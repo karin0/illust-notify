@@ -196,7 +196,7 @@ fn notify(bin: &str, args: &[&str]) -> Result<()> {
     debug!("notify: {} {:?}", bin, args);
     let r = Command::new(bin).args(args).spawn()?.wait()?;
     if !r.success() {
-        bail!("termux-notification failed: {:?}", r.code());
+        bail!("returned {:?}", r.code());
     }
     Ok(())
 }
@@ -212,8 +212,9 @@ async fn main() -> Result<()> {
     }
     pretty_env_logger::init_timed();
 
-    let dir = env::args().nth(1).unwrap_or_else(|| ".".to_string());
-    env::set_current_dir(&dir)?;
+    if let Some(dir) = env::args().nth(1) {
+        env::set_current_dir(&dir)?;
+    }
 
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
     debug!("config: {:#?}", config);
