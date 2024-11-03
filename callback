@@ -22,9 +22,21 @@ else
   flags=(--button1-action "cd '$dir';:>showimg;$rerun")
 fi
 
-exec termux-notification --ongoing --alert-once \
-  -i krrpxv1 -t "$pre$1 illusts" -c '' --icon favorite \
+flags+=(--ongoing --alert-once \
+  -t "$pre$1 illusts" -c '' --icon favorite \
   --button1 "SINCE = $3   ($4)" \
   --action "$action<'$dir/notify'" \
-  --on-delete ":<'$dir/notify'" \
-  "${flags[@]}"
+  --on-delete ":<'$dir/notify'")
+
+dist="$1"
+n=$((1 + dist / 30))
+
+for (( i = 0; i < n; i++ )); do
+  termux-notification -i krrpxv$i --group krrpxv$i "${flags[@]}" &
+done
+
+for (( i = n; i < 4; i++ )); do
+  termux-notification-remove krrpxv$i &
+done
+
+wait
