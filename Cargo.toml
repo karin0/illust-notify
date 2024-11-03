@@ -26,6 +26,7 @@ time = { version = "0.3", features = [
     "parsing",
     "local-offset",
     "macros",
+    "serde",
 ] }
 log = "0.4"
 anyhow = "1"
@@ -35,3 +36,4 @@ inotify = "0.11"
 itoa = "1.0"
 pretty_env_logger = { git = "https://github.com/karin0/pretty-env-logger.git" }
 pixiv = { git = "https://github.com/karin0/pvg-rs.git" }
+timeago = { version = "0.4", default-features = false }

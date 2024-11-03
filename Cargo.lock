@@ -558,6 +558,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "timeago",
  "tokio",
 ]
 
@@ -1270,6 +1271,12 @@ dependencies = [
  "num-conv",
  "time-core",
 ]
+
+[[package]]
+name = "timeago"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1710e589de0a76aaf295cd47a6699f6405737dbfd3cf2b75c92d000b548d0e6"
 
 [[package]]
 name = "tinyvec"

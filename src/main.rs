@@ -62,27 +62,38 @@ struct Page {
     next_url: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct AppState {
     dist: usize,
     iid: IllustId,
-    since: String,
+    since: OffsetDateTime,
     remain: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            dist: 0,
+            iid: 0,
+            since: OffsetDateTime::UNIX_EPOCH,
+            remain: false,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct AppDump {
     api: AuthedState,
     #[serde(flatten)]
     state: AppState,
 }
 
-#[derive(Debug, Clone)]
 struct App {
     api: AuthedClient,
     state: AppState,
     downloader: DownloadClient,
     tz: UtcOffset,
+    ago: timeago::Formatter,
 }
 
 impl Deref for App {
@@ -104,12 +115,12 @@ const DATE_FORMAT: &[format_description::FormatItem<'static>] =
 
 impl App {
     async fn new(refresh_token: &str) -> Result<Self> {
-        let api = AuthedClient::new(refresh_token).await?;
         Ok(Self {
-            api,
+            api: AuthedClient::new(refresh_token).await?,
             state: Default::default(),
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
+            ago: timeago::Formatter::new(),
         })
     }
 
@@ -119,6 +130,7 @@ impl App {
             state: dump.state,
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
+            ago: timeago::Formatter::new(),
         })
     }
 
@@ -129,12 +141,23 @@ impl App {
         }
     }
 
-    fn convert_date(&self, date: &str) -> Result<String> {
-        Ok(
-            OffsetDateTime::parse(date, &format_description::well_known::Iso8601::DEFAULT)?
-                .to_offset(self.tz)
-                .format(&DATE_FORMAT)?,
-        )
+    fn convert_date(&self, date: &str) -> Result<OffsetDateTime> {
+        let t = OffsetDateTime::parse(date, &format_description::well_known::Iso8601::DEFAULT)?
+            .to_offset(self.tz);
+        Ok(t)
+    }
+
+    fn since(&self) -> String {
+        match self.since.format(&DATE_FORMAT) {
+            Ok(s) => s,
+            Err(e) => format!("Error: {:?}", e),
+        }
+    }
+
+    fn since_ago(&self) -> String {
+        let now = OffsetDateTime::now_utc().to_offset(self.tz);
+        let d = now - self.since;
+        self.ago.convert(d.unsigned_abs())
     }
 
     async fn refresh(&mut self, max_pages: usize) -> Result<()> {
@@ -150,11 +173,8 @@ impl App {
                 if illust.is_bookmarked {
                     debug!("bookmarked: {illust:#?}");
                     if self.iid != illust.id {
+                        debug!("new id: {} time: {}", illust.id, illust.create_date);
                         self.since = self.convert_date(&illust.create_date)?;
-                        debug!(
-                            "new id: {} time: {:?} -> {:?}",
-                            illust.id, illust.create_date, self.since
-                        );
 
                         let mut image = self
                             .downloader
@@ -195,7 +215,9 @@ impl App {
 fn notify(bin: &str, args: &[&str]) -> Result<()> {
     debug!("notify: {} {:?}", bin, args);
     let r = Command::new(bin).args(args).spawn()?.wait()?;
-    if !r.success() {
+    if r.success() {
+        debug!("notify: returned {:?}", r.code());
+    } else {
         bail!("returned {:?}", r.code());
     }
     Ok(())
@@ -248,20 +270,26 @@ async fn main() -> Result<()> {
         if let Err(e) = app.refresh(config.max_pages).await {
             error!("refresh failed: {:#?}", e);
             token = Default::default();
-        } else if token != app.token() {
-            token = app.token();
-            info!(
-                "{}{} illusts since {} ({})",
-                if app.remain { "> " } else { "" },
-                app.dist,
-                app.since,
-                app.iid
-            );
+        } else {
+            let since = app.since();
+            let ago = app.since_ago();
+            if token != app.token() {
+                token = app.token();
+                info!(
+                    "{}{} illusts since {} ({}, {})",
+                    if app.remain { "> " } else { "" },
+                    app.dist,
+                    since,
+                    ago,
+                    app.iid
+                );
+            }
 
             let args = &[
                 itoa.format(app.dist),
                 itoa2.format(app.iid),
-                &app.since,
+                &app.since(),
+                &ago,
                 if app.remain { "1" } else { "" },
             ];
 

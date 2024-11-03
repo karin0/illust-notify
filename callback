@@ -5,29 +5,26 @@ fi
 
 set -euo pipefail
 dir="$PWD"
-rerun="bash callback '$1' '$2' '$3' '$4'"
+rerun="bash callback '$1' '$2' '$3' '$4' '$5'"
 
-if [ "$4" = 1 ]; then
-  b1="DIST > $1"
+if [ "$5" = 1 ]; then
+  pre='Over '
 else
-  b1="DIST = $1"
+  pre=
 fi
 
 url="https://www.pixiv.net/i/$2"
-# action="am start -a android.intent.action.VIEW -d $url"
-action="termux-open-url $url"
+action="am start -a android.intent.action.VIEW -d $url"
 
 if [ -f showimg ]; then
-  flags=(--image-path "$dir/img.jpg" --button2-action "cd '$dir';rm showimg;$rerun")
+  flags=(--image-path "$dir/img.jpg" --button1-action "cd '$dir';rm showimg;$rerun")
 else
-  flags=(--button2-action "cd '$dir';:>showimg;$rerun")
+  flags=(--button1-action "cd '$dir';:>showimg;$rerun")
 fi
 
 exec termux-notification --ongoing --alert-once \
-  -i krrpxv1 -t "$1 illusts" -c '' --icon favorite \
-  --button1 "$b1" \
-  --button1-action "$action" \
-  --button2 "SINCE = $3" \
+  -i krrpxv1 -t "$pre$1 illusts" -c '' --icon favorite \
+  --button1 "SINCE = $3   ($4)" \
   --action "$action<'$dir/notify'" \
   --on-delete ":<'$dir/notify'" \
   "${flags[@]}"
