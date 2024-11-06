@@ -32,11 +32,11 @@ dist="$1"
 n=$((1 + dist / 30))
 
 for (( i = 0; i < n; i++ )); do
-  termux-notification -i krrpxv$i --group krrpxv$i "${flags[@]}" &
+  timeout -v 30 termux-notification -i krrpxv$i --group krrpxv$i "${flags[@]}" &
 done
 
 for (( i = n; i < 4; i++ )); do
-  termux-notification-remove krrpxv$i &
+  timeout -v 30 termux-notification-remove krrpxv$i &
 done
 
 wait
