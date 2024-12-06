@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate log;
 
+use std::collections::BTreeSet;
 use std::io::{Seek, Write};
 use std::ops::{Deref, DerefMut};
 use std::process::Command;
@@ -19,11 +20,15 @@ use time::{format_description, macros::format_description, OffsetDateTime, UtcOf
 use tokio::sync::Notify;
 use tokio::time::{sleep, Duration};
 
-fn default_delay() -> u64 {
+fn default_delay() -> u32 {
     300
 }
 
-fn default_max_pages() -> usize {
+fn default_max_pages() -> u32 {
+    5
+}
+
+fn default_min_skip_pages() -> u32 {
     3
 }
 
@@ -37,9 +42,11 @@ const STATE_FILE: &str = "state.json";
 struct Config {
     refresh_token: String,
     #[serde(default = "default_delay")]
-    delay: u64,
+    delay: u32,
     #[serde(default = "default_max_pages")]
-    max_pages: usize,
+    max_pages: u32,
+    #[serde(default = "default_min_skip_pages")]
+    min_skip_pages: u32,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -64,19 +71,21 @@ struct Page {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct AppState {
-    dist: usize,
     iid: IllustId,
     since: OffsetDateTime,
     remain: bool,
+    skip: bool,
+    vis: BTreeSet<IllustId>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            dist: 0,
             iid: 0,
             since: OffsetDateTime::UNIX_EPOCH,
             remain: false,
+            skip: false,
+            vis: BTreeSet::new(),
         }
     }
 }
@@ -160,15 +169,15 @@ impl App {
         self.ago.convert(d.unsigned_abs())
     }
 
-    async fn refresh(&mut self, max_pages: usize) -> Result<()> {
+    async fn refresh(&mut self, config: &Config) -> Result<()> {
         self.api.ensure_authed().await?;
         let mut r: Page = self.api.illust_follow(Restrict::Public).await?;
 
-        self.remain = false;
-        self.dist = 0;
-        let mut pn = 0;
+        let mut pn = 1;
+        let mut ids = BTreeSet::new();
         loop {
             debug!("page {} has {} illusts", pn, r.illusts.len());
+            let mut may_skip = pn >= config.min_skip_pages;
             for illust in r.illusts {
                 if illust.is_bookmarked {
                     debug!("bookmarked: {illust:#?}");
@@ -189,26 +198,51 @@ impl App {
 
                         self.iid = illust.id;
                     }
+                    self.remain = false;
+                    self.skip = false;
+                    self.vis = ids;
                     return Ok(());
                 }
-                self.dist += 1;
-            }
-            if let Some(url) = r.next_url {
-                pn += 1;
-                if pn >= max_pages {
-                    warn!("reached max pages");
-                    self.remain = true;
-                } else {
-                    r = self.api.call_url(&url).await?;
-                    continue;
+                ids.insert(illust.id);
+                if may_skip && !self.vis.contains(&illust.id) {
+                    may_skip = false;
                 }
             }
+            if may_skip {
+                if !self.skip {
+                    warn!("skipping from page {}", pn);
+                    self.skip = true;
+                }
+                self.vis.extend(ids.into_iter());
+                return Ok(());
+            }
+            if let Some(url) = r.next_url {
+                if pn >= config.max_pages {
+                    if !self.remain {
+                        warn!("reached max pages {}", pn);
+                        self.remain = true;
+                    }
+                } else {
+                    r = self.api.call_url(&url).await?;
+                    pn += 1;
+                    continue;
+                }
+            } else {
+                warn!("no more pages");
+                self.remain = false;
+                self.skip = false;
+            }
+            self.vis.extend(ids.into_iter());
             return Ok(());
         }
     }
 
+    fn dist(&self) -> usize {
+        self.vis.len()
+    }
+
     fn token(&self) -> (IllustId, usize) {
-        (self.iid, self.dist)
+        (self.iid, self.dist())
     }
 }
 
@@ -262,12 +296,12 @@ async fn main() -> Result<()> {
         tx.notify_waiters();
     })?;
 
-    let delay = Duration::from_secs(config.delay);
+    let delay = Duration::from_secs(config.delay.into());
     let mut token = Default::default();
     let mut itoa = itoa::Buffer::new();
     let mut itoa2 = itoa::Buffer::new();
     loop {
-        if let Err(e) = app.refresh(config.max_pages).await {
+        if let Err(e) = app.refresh(&config).await {
             error!("refresh failed: {:#?}", e);
             token = Default::default();
         } else {
@@ -276,9 +310,10 @@ async fn main() -> Result<()> {
             if token != app.token() {
                 token = app.token();
                 info!(
-                    "{}{} illusts since {} ({}, {})",
+                    "{}{}{} illusts since {} ({}, {})",
                     if app.remain { "> " } else { "" },
-                    app.dist,
+                    if app.skip { "~ " } else { "" },
+                    app.dist(),
                     since,
                     ago,
                     app.iid
@@ -286,11 +321,12 @@ async fn main() -> Result<()> {
             }
 
             let args = &[
-                itoa.format(app.dist),
+                itoa.format(app.dist()),
                 itoa2.format(app.iid),
                 &app.since(),
                 &ago,
-                if app.remain { "1" } else { "" },
+                if app.remain { "1" } else { "0" },
+                if app.skip { "1" } else { "0" },
             ];
 
             if let Err(e) = notify(CALLBACK_FILE, args) {

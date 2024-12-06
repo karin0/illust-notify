@@ -5,10 +5,16 @@ fi
 
 set -euo pipefail
 dir="$PWD"
-rerun="bash callback '$1' '$2' '$3' '$4' '$5'"
+rerun="bash callback '$1' '$2' '$3' '$4' '$5' '$6'"
 
 if [ "$5" = 1 ]; then
-  pre='Over '
+  if [ "$6" = 1 ]; then
+    pre='⚠️ '
+  else
+    pre='> '
+  fi
+elif [ "$6" = 1 ]; then
+  pre='~ '
 else
   pre=
 fi
