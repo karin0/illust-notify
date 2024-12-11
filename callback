@@ -41,8 +41,15 @@ for (( i = 0; i < n; i++ )); do
   timeout -v 30 termux-notification -i krrpxv$i --group krrpxv$i "${flags[@]}" &
 done
 
-for (( i = n; i < 4; i++ )); do
-  timeout -v 30 termux-notification-remove krrpxv$i &
-done
+if n0=$(cat num 2>/dev/null); then
+  for (( i = n; i < n0; i++ )); do
+    timeout -v 30 termux-notification-remove krrpxv$i &
+  done
+  if [ "$n0" != "$n" ]; then
+    echo "$n" > num
+  fi
+else
+  echo "$n" > num
+fi
 
 wait
