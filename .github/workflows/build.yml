@@ -28,7 +28,7 @@ jobs:
             /opt/{ghc,az} \
             /usr/local/share/boost /usr/local/graalvm /usr/local/julia* "$AGENT_TOOLSDIRECTORY"
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - uses: actions/cache@v3
         with:
@@ -60,13 +60,13 @@ jobs:
           cargo update
           target=${{ matrix.target }}
           name=${{ github.event.repository.name }}
-          cross build --release --target $target
+          cross build --release --target $target --features inotify
 
           FILE=$name-${GITHUB_SHA::7}-$target.xz
           xz -cv target/$target/release/$name > $FILE
           echo "FILE=$FILE" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FILE }}
           path: ${{ env.FILE }}

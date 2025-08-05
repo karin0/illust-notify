@@ -8,17 +8,18 @@ use std::process::Command;
 use std::sync::Arc;
 use std::{env, fs};
 
-use anyhow::{bail, Result};
-use futures::{FutureExt, StreamExt};
-use inotify::{Inotify, WatchMask};
+use anyhow::{Result, bail};
 use pixiv::aapi::Restrict;
 use pixiv::client::{AuthedClient, AuthedState};
 use pixiv::download::DownloadClient;
 use pixiv::model::IllustId;
 use serde::{Deserialize, Serialize};
-use time::{format_description, macros::format_description, OffsetDateTime, UtcOffset};
+use time::{OffsetDateTime, UtcOffset, format_description, macros::format_description};
 use tokio::sync::Notify;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
+
+#[cfg(feature = "inotify")]
+use futures::{FutureExt, StreamExt};
 
 fn default_delay() -> u32 {
     300
@@ -126,7 +127,7 @@ impl App {
     async fn new(refresh_token: &str) -> Result<Self> {
         Ok(Self {
             api: AuthedClient::new(refresh_token).await?,
-            state: Default::default(),
+            state: AppState::default(),
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
@@ -159,7 +160,7 @@ impl App {
     fn since(&self) -> String {
         match self.since.format(&DATE_FORMAT) {
             Ok(s) => s,
-            Err(e) => format!("Error: {:?}", e),
+            Err(e) => format!("Error: {e:?}"),
         }
     }
 
@@ -210,7 +211,7 @@ impl App {
             }
             if may_skip {
                 if !self.skip {
-                    warn!("skipping from page {}", pn);
+                    warn!("skipping from page {pn}");
                     self.skip = true;
                 }
                 self.vis.extend(ids.into_iter());
@@ -219,7 +220,7 @@ impl App {
             if let Some(url) = r.next_url {
                 if pn >= config.max_pages {
                     if !self.remain {
-                        warn!("reached max pages {}", pn);
+                        warn!("reached max pages {pn}");
                         self.remain = true;
                     }
                 } else {
@@ -247,7 +248,7 @@ impl App {
 }
 
 fn notify(bin: &str, args: &[&str]) -> Result<()> {
-    debug!("notify: {} {:?}", bin, args);
+    debug!("notify: {bin} {args:?}");
     let r = Command::new(bin).args(args).spawn()?.wait()?;
     if r.success() {
         debug!("notify: returned {:?}", r.code());
@@ -261,10 +262,18 @@ fn load_state(path: &str) -> Result<App> {
     App::load(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+fn bye(app: App) -> Result<()> {
+    info!("dumping state");
+    fs::write(STATE_FILE, serde_json::to_string_pretty(&app.dump())?)?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "info");
+        unsafe {
+            env::set_var("RUST_LOG", "info");
+        }
     }
     pretty_env_logger::init_timed();
 
@@ -273,21 +282,28 @@ async fn main() -> Result<()> {
     }
 
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
-    debug!("config: {:#?}", config);
+    debug!("config: {config:#?}");
 
     let mut app = match load_state(STATE_FILE) {
         Ok(app) => app,
         Err(e) => {
-            warn!("load state: {:#?}", e);
+            warn!("load state: {e:#?}");
             App::new(&config.refresh_token).await?
         }
     };
 
     drop(fs::File::create(NOTIFY_FILE)?);
-    let inotify = Inotify::init()?;
-    inotify.watches().add(NOTIFY_FILE, WatchMask::OPEN)?;
+
+    #[cfg(feature = "inotify")]
     let mut buf = [0; 128];
-    let mut inotify = inotify.into_event_stream(&mut buf)?;
+
+    #[cfg(feature = "inotify")]
+    let mut inotify = {
+        use inotify::{Inotify, WatchMask};
+        let inotify = Inotify::init()?;
+        inotify.watches().add(NOTIFY_FILE, WatchMask::OPEN)?;
+        inotify.into_event_stream(&mut buf)?
+    };
 
     let rx = Arc::new(Notify::new());
     let tx = rx.clone();
@@ -302,7 +318,7 @@ async fn main() -> Result<()> {
     let mut itoa2 = itoa::Buffer::new();
     loop {
         if let Err(e) = app.refresh(&config).await {
-            error!("refresh failed: {:#?}", e);
+            error!("refresh failed: {e:#?}");
             token = Default::default();
         } else {
             let since = app.since();
@@ -330,20 +346,20 @@ async fn main() -> Result<()> {
             ];
 
             if let Err(e) = notify(CALLBACK_FILE, args) {
-                error!("callback: {:#?}", e);
+                error!("callback: {e:#?}");
             }
         }
 
+        #[cfg(feature = "inotify")]
         while let Some(e) = inotify.next().now_or_never() {
             info!("inotify: {:#?}", e);
         }
 
+        #[cfg(feature = "inotify")]
         tokio::select! {
             _ = sleep(delay) => {},
             _ = rx.notified() => {
-                info!("dumping state");
-                fs::write(STATE_FILE, serde_json::to_string_pretty(&app.dump())?)?;
-                return Ok(());
+                return bye(app);
             },
             r = inotify.next() => {
                 match r {
@@ -356,6 +372,14 @@ async fn main() -> Result<()> {
                 }
                 token = Default::default();
             }
+        }
+
+        #[cfg(not(feature = "inotify"))]
+        tokio::select! {
+            _ = sleep(delay) => {},
+            _ = rx.notified() => {
+                return bye(app);
+            },
         }
     }
 }
