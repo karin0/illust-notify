@@ -35,9 +35,11 @@ fn default_min_skip_pages() -> u32 {
 
 const CONFIG_FILE: &str = "config.json";
 const CALLBACK_FILE: &str = "./callback";
-const NOTIFY_FILE: &str = "notify";
 const IMG_FILE: &str = "img.jpg";
 const STATE_FILE: &str = "state.json";
+
+#[cfg(feature = "inotify")]
+const NOTIFY_FILE: &str = "notify";
 
 #[derive(Deserialize, Debug, Clone)]
 struct Config {
@@ -48,6 +50,7 @@ struct Config {
     max_pages: u32,
     #[serde(default = "default_min_skip_pages")]
     min_skip_pages: u32,
+    notify_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -292,18 +295,37 @@ async fn main() -> Result<()> {
         }
     };
 
-    drop(fs::File::create(NOTIFY_FILE)?);
-
     #[cfg(feature = "inotify")]
     let mut buf = [0; 128];
 
     #[cfg(feature = "inotify")]
     let mut inotify = {
+        drop(fs::File::create(NOTIFY_FILE)?);
         use inotify::{Inotify, WatchMask};
         let inotify = Inotify::init()?;
         inotify.watches().add(NOTIFY_FILE, WatchMask::OPEN)?;
         inotify.into_event_stream(&mut buf)?
     };
+
+    let mut exec = false;
+    if let Ok(metadata) = fs::metadata(CALLBACK_FILE) {
+        if metadata.is_file() && {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            true
+        } {
+            exec = true;
+        }
+    }
+
+    let request = config
+        .notify_url
+        .as_ref()
+        .map(|url| (reqwest::Client::new(), url));
 
     let rx = Arc::new(Notify::new());
     let tx = rx.clone();
@@ -336,17 +358,32 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let args = &[
-                itoa.format(app.dist()),
-                itoa2.format(app.iid),
-                &app.since(),
-                &ago,
-                if app.remain { "1" } else { "0" },
-                if app.skip { "1" } else { "0" },
-            ];
+            if exec {
+                let args = &[
+                    itoa.format(app.dist()),
+                    itoa2.format(app.iid),
+                    &app.since(),
+                    &ago,
+                    if app.remain { "1" } else { "0" },
+                    if app.skip { "1" } else { "0" },
+                ];
 
-            if let Err(e) = notify(CALLBACK_FILE, args) {
-                error!("callback: {e:#?}");
+                if let Err(e) = notify(CALLBACK_FILE, args) {
+                    error!("callback: {e:#?}");
+                }
+            }
+
+            if let Some((client, url)) = &request {
+                let url = format!("{url}/{}", app.dist());
+                match client.get(&url).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_success() {
+                            error!("request: {status}: {}", resp.text().await?);
+                        }
+                    }
+                    Err(e) => error!("send request: {e:#?}"),
+                }
             }
         }
 
@@ -357,8 +394,8 @@ async fn main() -> Result<()> {
 
         #[cfg(feature = "inotify")]
         tokio::select! {
-            _ = sleep(delay) => {},
-            _ = rx.notified() => {
+            () = sleep(delay) => {},
+            () = rx.notified() => {
                 return bye(app);
             },
             r = inotify.next() => {
@@ -376,8 +413,8 @@ async fn main() -> Result<()> {
 
         #[cfg(not(feature = "inotify"))]
         tokio::select! {
-            _ = sleep(delay) => {},
-            _ = rx.notified() => {
+            () = sleep(delay) => {},
+            () = rx.notified() => {
                 return bye(app);
             },
         }
