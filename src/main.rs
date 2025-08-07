@@ -2,21 +2,21 @@
 extern crate log;
 
 use std::collections::BTreeSet;
-use std::io::{Seek, Write};
 use std::ops::{Deref, DerefMut};
-use std::process::Command;
 use std::sync::Arc;
 use std::{env, fs};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use pixiv::aapi::Restrict;
 use pixiv::client::{AuthedClient, AuthedState};
-use pixiv::download::DownloadClient;
 use pixiv::model::IllustId;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset, format_description, macros::format_description};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
+
+#[cfg(feature = "download")]
+use pixiv::download::DownloadClient;
 
 #[cfg(feature = "inotify")]
 use futures::{FutureExt, StreamExt};
@@ -34,9 +34,13 @@ fn default_min_skip_pages() -> u32 {
 }
 
 const CONFIG_FILE: &str = "config.json";
-const CALLBACK_FILE: &str = "./callback";
-const IMG_FILE: &str = "img.jpg";
 const STATE_FILE: &str = "state.json";
+
+#[cfg(feature = "callback")]
+const CALLBACK_FILE: &str = "./callback";
+
+#[cfg(feature = "download")]
+const IMG_FILE: &str = "img.jpg";
 
 #[cfg(feature = "inotify")]
 const NOTIFY_FILE: &str = "notify";
@@ -104,6 +108,7 @@ struct AppDump {
 struct App {
     api: AuthedClient,
     state: AppState,
+    #[cfg(feature = "download")]
     downloader: DownloadClient,
     tz: UtcOffset,
     ago: timeago::Formatter,
@@ -131,6 +136,7 @@ impl App {
         Ok(Self {
             api: AuthedClient::new(refresh_token).await?,
             state: AppState::default(),
+            #[cfg(feature = "download")]
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
@@ -141,6 +147,7 @@ impl App {
         Ok(Self {
             api: AuthedClient::load(dump.api),
             state: dump.state,
+            #[cfg(feature = "download")]
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
@@ -189,16 +196,21 @@ impl App {
                         debug!("new id: {} time: {}", illust.id, illust.create_date);
                         self.since = self.convert_date(&illust.create_date)?;
 
-                        let mut image = self
-                            .downloader
-                            .download(&illust.image_urls.square_medium)
-                            .await?;
-                        let mut file = fs::File::create(IMG_FILE)?;
+                        #[cfg(feature = "download")]
+                        {
+                            use std::io::{Seek, Write};
 
-                        while let Some(chunk) = image.chunk().await? {
-                            file.write_all(&chunk)?;
+                            let mut image = self
+                                .downloader
+                                .download(&illust.image_urls.square_medium)
+                                .await?;
+                            let mut file = fs::File::create(IMG_FILE)?;
+
+                            while let Some(chunk) = image.chunk().await? {
+                                file.write_all(&chunk)?;
+                            }
+                            debug!("downloaded {} bytes", file.stream_position()?);
                         }
-                        debug!("downloaded {} bytes", file.stream_position()?);
 
                         self.iid = illust.id;
                     }
@@ -250,13 +262,14 @@ impl App {
     }
 }
 
+#[cfg(feature = "callback")]
 fn notify(bin: &str, args: &[&str]) -> Result<()> {
     debug!("notify: {bin} {args:?}");
-    let r = Command::new(bin).args(args).spawn()?.wait()?;
+    let r = std::process::Command::new(bin).args(args).spawn()?.wait()?;
     if r.success() {
         debug!("notify: returned {:?}", r.code());
     } else {
-        bail!("returned {:?}", r.code());
+        anyhow::bail!("returned {:?}", r.code());
     }
     Ok(())
 }
@@ -269,6 +282,35 @@ fn bye(app: App) -> Result<()> {
     info!("dumping state");
     fs::write(STATE_FILE, serde_json::to_string_pretty(&app.dump())?)?;
     Ok(())
+}
+
+#[cfg(feature = "callback")]
+struct Callback {
+    itoa: itoa::Buffer,
+    itoa2: itoa::Buffer,
+}
+
+#[cfg(feature = "callback")]
+impl Callback {
+    fn new() -> Option<Self> {
+        if let Ok(metadata) = fs::metadata(CALLBACK_FILE) {
+            if metadata.is_file() && {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                true
+            } {
+                return Some(Self {
+                    itoa: itoa::Buffer::new(),
+                    itoa2: itoa::Buffer::new(),
+                });
+            }
+        }
+        None
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -307,20 +349,8 @@ async fn main() -> Result<()> {
         inotify.into_event_stream(&mut buf)?
     };
 
-    let mut exec = false;
-    if let Ok(metadata) = fs::metadata(CALLBACK_FILE) {
-        if metadata.is_file() && {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            }
-            #[cfg(not(unix))]
-            true
-        } {
-            exec = true;
-        }
-    }
+    #[cfg(feature = "callback")]
+    let mut callback = Callback::new();
 
     let request = config
         .notify_url
@@ -336,8 +366,7 @@ async fn main() -> Result<()> {
 
     let delay = Duration::from_secs(config.delay.into());
     let mut token = Default::default();
-    let mut itoa = itoa::Buffer::new();
-    let mut itoa2 = itoa::Buffer::new();
+
     loop {
         if let Err(e) = app.refresh(&config).await {
             error!("refresh failed: {e:#?}");
@@ -358,10 +387,11 @@ async fn main() -> Result<()> {
                 );
             }
 
-            if exec {
+            #[cfg(feature = "callback")]
+            if let Some(cb) = &mut callback {
                 let args = &[
-                    itoa.format(app.dist()),
-                    itoa2.format(app.iid),
+                    cb.itoa.format(app.dist()),
+                    cb.itoa2.format(app.iid),
                     &app.since(),
                     &ago,
                     if app.remain { "1" } else { "0" },
@@ -404,7 +434,8 @@ async fn main() -> Result<()> {
                         info!("refreshing");
                     }
                     r => {
-                        bail!("inotify: {:?}", r);
+                        error!("inotify closed: {r:#?}");
+                        return bye(app);
                     }
                 }
                 token = Default::default();

@@ -60,7 +60,7 @@ jobs:
           cargo update
           target=${{ matrix.target }}
           name=${{ github.event.repository.name }}
-          cross build --release --target $target --features inotify
+          cross build --release --target $target --features inotify,callback,download
 
           FILE=$name-${GITHUB_SHA::7}-$target.xz
           xz -cv target/$target/release/$name > $FILE
