@@ -21,6 +21,9 @@ use pixiv::download::DownloadClient;
 #[cfg(feature = "inotify")]
 use futures::{FutureExt, StreamExt};
 
+#[cfg(all(feature = "inotify", feature = "notify"))]
+compile_error!("`inotify` and `notify` features conflict");
+
 fn default_delay() -> u32 {
     300
 }
@@ -42,7 +45,7 @@ const CALLBACK_FILE: &str = "./callback";
 #[cfg(feature = "download")]
 const IMG_FILE: &str = "img.jpg";
 
-#[cfg(feature = "inotify")]
+#[cfg(any(feature = "inotify", feature = "notify"))]
 const NOTIFY_FILE: &str = "notify";
 
 #[derive(Deserialize, Debug, Clone)]
@@ -263,13 +266,13 @@ impl App {
 }
 
 #[cfg(feature = "callback")]
-fn notify(bin: &str, args: &[&str]) -> Result<()> {
-    debug!("notify: {bin} {args:?}");
+fn do_callback(bin: &str, args: &[&str]) -> Result<()> {
+    debug!("callback: {bin} {args:?}");
     let r = std::process::Command::new(bin).args(args).spawn()?.wait()?;
     if r.success() {
-        debug!("notify: returned {:?}", r.code());
+        debug!("callback: {:?}", r.code());
     } else {
-        anyhow::bail!("returned {:?}", r.code());
+        anyhow::bail!("callback returned {:?}", r.code());
     }
     Ok(())
 }
@@ -337,16 +340,39 @@ async fn main() -> Result<()> {
         }
     };
 
+    #[cfg(any(feature = "inotify", feature = "notify"))]
+    drop(fs::File::create(NOTIFY_FILE)?);
+
     #[cfg(feature = "inotify")]
     let mut buf = [0; 128];
 
     #[cfg(feature = "inotify")]
     let mut inotify = {
-        drop(fs::File::create(NOTIFY_FILE)?);
         use inotify::{Inotify, WatchMask};
         let inotify = Inotify::init()?;
         inotify.watches().add(NOTIFY_FILE, WatchMask::OPEN)?;
         inotify.into_event_stream(&mut buf)?
+    };
+
+    #[cfg(feature = "notify")]
+    let (_notify, mut notify) = {
+        use notify::{Event, RecursiveMode, Result, Watcher, recommended_watcher};
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut watcher = recommended_watcher(move |res: Result<Event>| match res {
+            Ok(event) => {
+                debug!("notify: {event:#?}");
+                futures::executor::block_on(async {
+                    if let Err(e) = tx.send(event).await {
+                        error!("send notify: {e:#?}");
+                    }
+                });
+            }
+            Err(e) => error!("notify: {e:#?}"),
+        })?;
+
+        watcher.watch(NOTIFY_FILE.as_ref(), RecursiveMode::NonRecursive)?;
+        (watcher, rx)
     };
 
     #[cfg(feature = "callback")]
@@ -398,7 +424,7 @@ async fn main() -> Result<()> {
                     if app.skip { "1" } else { "0" },
                 ];
 
-                if let Err(e) = notify(CALLBACK_FILE, args) {
+                if let Err(e) = do_callback(CALLBACK_FILE, args) {
                     error!("callback: {e:#?}");
                 }
             }
@@ -419,7 +445,12 @@ async fn main() -> Result<()> {
 
         #[cfg(feature = "inotify")]
         while let Some(e) = inotify.next().now_or_never() {
-            info!("inotify: {:#?}", e);
+            debug!("inotify omiting: {:#?}", e);
+        }
+
+        #[cfg(feature = "notify")]
+        while let Ok(event) = notify.try_recv() {
+            debug!("notify omitting: {event:#?}");
         }
 
         #[cfg(feature = "inotify")]
@@ -430,11 +461,11 @@ async fn main() -> Result<()> {
             },
             r = inotify.next() => {
                 match r {
-                    Some(Ok(_)) => {
-                        info!("refreshing");
+                    Some(Ok(event)) => {
+                        debug!("inotify: {event:#?}");
                     }
                     r => {
-                        error!("inotify closed: {r:#?}");
+                        error!("inotify: {r:#?}");
                         return bye(app);
                     }
                 }
@@ -442,7 +473,24 @@ async fn main() -> Result<()> {
             }
         }
 
-        #[cfg(not(feature = "inotify"))]
+        #[cfg(feature = "notify")]
+        tokio::select! {
+            () = sleep(delay) => {},
+            () = rx.notified() => {
+                return bye(app);
+            },
+            r = notify.recv() => {
+                if let Some(event) = r {
+                    debug!("notify got: {event:#?}");
+                } else {
+                    error!("notify closed");
+                    return bye(app);
+                }
+                token = Default::default();
+            }
+        }
+
+        #[cfg(not(any(feature = "inotify", feature = "notify")))]
         tokio::select! {
             () = sleep(delay) => {},
             () = rx.notified() => {
