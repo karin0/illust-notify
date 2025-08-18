@@ -2,3 +2,5 @@
 /*.json
 /notify
 /img*
+__pycache__
+.venv

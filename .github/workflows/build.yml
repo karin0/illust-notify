@@ -16,11 +16,17 @@ jobs:
       matrix:
         target:
           - aarch64-linux-android
+          - x86_64-pc-windows-msvc
     env:
       RUST_BACKTRACE: full
-    runs-on: 'ubuntu-latest'
+      RUSTFLAGS: ${{ contains(matrix.target, 'msvc') && '-C target-feature=+crt-static' || '' }}
+      CARGO: ${{ contains(matrix.target, 'android') && 'cross' || 'cargo' }}
+      FEATURES: ${{ contains(matrix.target, 'android') && 'inotify,callback,download' || 'tray' }}
+
+    runs-on: ${{ contains(matrix.target, 'msvc') && 'windows-latest' || 'ubuntu-latest' }}
     steps:
       - name: Cleanup pre-installed tools
+        if: runner.os != 'Windows'
         run: |
           # This is a fix for https://github.com/actions/virtual-environments/issues/1918
           shopt -s nullglob
@@ -42,29 +48,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
-          default: true
+          targets: ${{ matrix.target }}
+
+      - run: cargo fmt --check
+      - run: cargo update
 
       - name: Install cross
+        if: ${{ matrix.target == 'aarch64-linux-android' }}
         continue-on-error: true
         run: |
           cargo install cross --git https://github.com/cross-rs/cross || true
           cross --version
 
-      - name: Build ${{ matrix.target }}
+      - run: ${{ env.CARGO }} clippy --target ${{ matrix.target }} --features ${{ env.FEATURES }} -- -D warnings
+      - run: ${{ env.CARGO }} build --release --target ${{ matrix.target }} --features ${{ env.FEATURES }}
+
+      - name: Compress binary
+        if: ${{ runner.os != 'Windows' }}
         run: |
-          set -e
-          cargo update
+          set -ex
           target=${{ matrix.target }}
           name=${{ github.event.repository.name }}
-          cross build --release --target $target --features inotify,callback,download
-
           FILE=$name-${GITHUB_SHA::7}-$target.xz
           xz -cv target/$target/release/$name > $FILE
           echo "FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: Compress binary
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $name = '${{ github.event.repository.name }}'
+          $FILE = "$name-$($env:GITHUB_SHA.Substring(0, 7))-$target.xz"
+          7z a $FILE target/$target/release/$name.exe
+          echo "FILE=$FILE" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:

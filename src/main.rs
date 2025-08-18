@@ -21,8 +21,15 @@ use pixiv::download::DownloadClient;
 #[cfg(feature = "inotify")]
 use futures::{FutureExt, StreamExt};
 
-#[cfg(all(feature = "inotify", feature = "notify"))]
-compile_error!("`inotify` and `notify` features conflict");
+#[cfg(feature = "tray")]
+use pyo3::prelude::*;
+
+#[cfg(any(
+    all(feature = "inotify", feature = "notify"),
+    all(feature = "inotify", feature = "tray"),
+    all(feature = "notify", feature = "tray")
+))]
+compile_error!("features conflict");
 
 fn default_delay() -> u32 {
     300
@@ -57,7 +64,10 @@ struct Config {
     max_pages: u32,
     #[serde(default = "default_min_skip_pages")]
     min_skip_pages: u32,
+    #[cfg(feature = "request")]
     notify_url: Option<String>,
+    #[cfg(feature = "tray")]
+    python_site_packages: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -296,8 +306,9 @@ struct Callback {
 #[cfg(feature = "callback")]
 impl Callback {
     fn new() -> Option<Self> {
-        if let Ok(metadata) = fs::metadata(CALLBACK_FILE) {
-            if metadata.is_file() && {
+        if let Ok(metadata) = fs::metadata(CALLBACK_FILE)
+            && metadata.is_file()
+            && {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -305,12 +316,12 @@ impl Callback {
                 }
                 #[cfg(not(unix))]
                 true
-            } {
-                return Some(Self {
-                    itoa: itoa::Buffer::new(),
-                    itoa2: itoa::Buffer::new(),
-                });
             }
+        {
+            return Some(Self {
+                itoa: itoa::Buffer::new(),
+                itoa2: itoa::Buffer::new(),
+            });
         }
         None
     }
@@ -318,17 +329,22 @@ impl Callback {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if env::var("RUST_LOG").is_err() {
-        unsafe {
-            env::set_var("RUST_LOG", "info");
-        }
-    }
     pretty_env_logger::init_timed();
 
-    if let Some(dir) = env::args().nth(1) {
+    let mut args = env::args();
+    args.next();
+    if let Some(dir) = args.next() {
         env::set_current_dir(&dir)?;
     }
 
+    #[cfg(windows)]
+    let daemon = args.any(|s| s == "-d");
+    drop(args);
+
+    #[cfg(feature = "tray")]
+    let mut config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
+
+    #[cfg(not(feature = "tray"))]
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
     debug!("config: {config:#?}");
 
@@ -378,6 +394,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "callback")]
     let mut callback = Callback::new();
 
+    #[cfg(feature = "request")]
     let request = config
         .notify_url
         .as_ref()
@@ -390,8 +407,68 @@ async fn main() -> Result<()> {
         tx.notify_waiters();
     })?;
 
+    #[cfg(feature = "tray")]
+    let tray_rx = {
+        use pyo3::types::{PyCFunction, PyDict, PyTuple};
+
+        pyo3::prepare_freethreaded_python();
+
+        let tx = rx.clone();
+        let exit = move |_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+            warn!("exiting from tray");
+            tx.notify_waiters();
+        };
+
+        let rx = Arc::new(Notify::new());
+        let tx = rx.clone();
+
+        let notify = move |_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+            tx.notify_waiters();
+        };
+
+        Python::with_gil(|py| {
+            let sys = py.import("sys")?;
+            let version = sys.getattr("version")?;
+            info!("Python: {version}");
+
+            let path = sys.getattr("path")?;
+
+            if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+                let site_packages = format!("{venv}/Lib/site-packages");
+                path.call_method1("insert", (0, site_packages))?;
+            } else if let Some(python_site_packages) = config.python_site_packages.take() {
+                path.call_method1("insert", (0, python_site_packages))?;
+            }
+
+            path.call_method1("insert", (0, "."))?;
+
+            let exit = PyCFunction::new_closure(py, None, None, exit)?;
+            let notify = PyCFunction::new_closure(py, None, None, notify)?;
+
+            PyModule::import(py, "tray")?.call_method1("start", (exit, notify))?;
+            PyResult::Ok(())
+        })?;
+        rx
+    };
+
     let delay = Duration::from_secs(config.delay.into());
     let mut token = Default::default();
+
+    #[cfg(windows)]
+    if daemon {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, SW_HIDE, ShowWindow,
+        };
+        unsafe {
+            let handle = GetForegroundWindow();
+            if handle.is_null() {
+                warn!("no foreground window found");
+            } else {
+                let r = ShowWindow(handle, SW_HIDE);
+                info!("hiding console window: {handle:?} {r:?}");
+            }
+        }
+    }
 
     loop {
         if let Err(e) = app.refresh(&config).await {
@@ -411,6 +488,30 @@ async fn main() -> Result<()> {
                     ago,
                     app.iid
                 );
+
+                #[cfg(feature = "tray")]
+                if let Err(e) = Python::with_gil(|py| {
+                    PyModule::import(py, "tray")?
+                        .getattr("update")?
+                        .call1((app.dist(),))?;
+                    PyResult::Ok(())
+                }) {
+                    error!("tray: {e:#?}");
+                }
+
+                #[cfg(feature = "request")]
+                if let Some((client, url)) = &request {
+                    let url = format!("{url}/{}", app.dist());
+                    match client.get(&url).send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if !status.is_success() {
+                                error!("request: {status}: {}", resp.text().await?);
+                            }
+                        }
+                        Err(e) => error!("send request: {e:#?}"),
+                    }
+                }
             }
 
             #[cfg(feature = "callback")]
@@ -428,24 +529,11 @@ async fn main() -> Result<()> {
                     error!("callback: {e:#?}");
                 }
             }
-
-            if let Some((client, url)) = &request {
-                let url = format!("{url}/{}", app.dist());
-                match client.get(&url).send().await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if !status.is_success() {
-                            error!("request: {status}: {}", resp.text().await?);
-                        }
-                    }
-                    Err(e) => error!("send request: {e:#?}"),
-                }
-            }
         }
 
         #[cfg(feature = "inotify")]
         while let Some(e) = inotify.next().now_or_never() {
-            debug!("inotify omiting: {:#?}", e);
+            debug!("inotify omiting: {e:#?}");
         }
 
         #[cfg(feature = "notify")]
@@ -453,49 +541,50 @@ async fn main() -> Result<()> {
             debug!("notify omitting: {event:#?}");
         }
 
-        #[cfg(feature = "inotify")]
-        tokio::select! {
-            () = sleep(delay) => {},
-            () = rx.notified() => {
-                return bye(app);
-            },
-            r = inotify.next() => {
-                match r {
-                    Some(Ok(event)) => {
-                        debug!("inotify: {event:#?}");
+        macro_rules! do_select {
+            (
+                $token:ident,
+                $res0:tt = $src0:expr => $body0:block,
+                $res1:tt = $src1:expr => $body1:block
+                $(, $feature:literal: $result:tt = $source:expr => $body:block)+
+            ) => {
+                $(
+                    #[cfg(feature = $feature)]
+                    tokio::select! {
+                        $res0 = $src0 => $body0,
+                        $res1 = $src1 => $body1,
+                        $result = $source => {
+                            $body
+                            $token = Default::default();
+                        }
                     }
-                    r => {
-                        error!("inotify: {r:#?}");
-                        return bye(app);
-                    }
-                }
-                token = Default::default();
-            }
+                )+
+            };
         }
 
-        #[cfg(feature = "notify")]
-        tokio::select! {
+        do_select!(
+            token,
             () = sleep(delay) => {},
             () = rx.notified() => {
                 return bye(app);
             },
-            r = notify.recv() => {
+            "inotify": r = inotify.next() => {
+                if let Some(Ok(event)) = r {
+                    debug!("inotify: {event:#?}");
+                } else {
+                    error!("inotify: {r:#?}");
+                    return bye(app);
+                }
+            },
+            "notify": r = notify.recv() => {
                 if let Some(event) = r {
                     debug!("notify got: {event:#?}");
                 } else {
                     error!("notify closed");
                     return bye(app);
                 }
-                token = Default::default();
-            }
-        }
-
-        #[cfg(not(any(feature = "inotify", feature = "notify")))]
-        tokio::select! {
-            () = sleep(delay) => {},
-            () = rx.notified() => {
-                return bye(app);
             },
-        }
+            "tray": () = tray_rx.notified() => {}
+        );
     }
 }
