@@ -5,7 +5,7 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 url = 'https://www.pixiv.net/bookmark_new_illust.php'
-cleanup = notify = None
+callback = None
 sys.stdout = sys.stderr
 
 
@@ -47,8 +47,8 @@ def click(_icon, _item):
         else:
             print('Failed to open', url)
     finally:
-        if notify:
-            notify()
+        if callback:
+            callback(1)
 
 
 def quit(icon, _item):
@@ -56,15 +56,18 @@ def quit(icon, _item):
         print('Quitting...')
         icon.stop()
     finally:
-        if cleanup:
-            cleanup()
+        if callback:
+            callback()
 
 
 icon = pystray.Icon(
     'QAQ',
     icon=create_icon_image(42),
     menu=pystray.Menu(
-        pystray.MenuItem('Go...', click, default=True), pystray.MenuItem('Quit', quit)
+        pystray.MenuItem('Go...', click, default=True),
+        pystray.MenuItem('Hide', lambda _, __: callback and callback(2)),
+        pystray.MenuItem('Show', lambda _, __: callback and callback(3)),
+        pystray.MenuItem('Quit', quit),
     ),
 )
 
@@ -73,10 +76,10 @@ def update(num):
     icon.icon = create_icon_image(num)
 
 
-def start(cleanup_callback=None, notify_callback=None):
-    global cleanup, notify
-    cleanup = cleanup_callback
-    notify = notify_callback
+def start(cb=None):
+    global callback
+    if cb:
+        callback = cb
     icon.run_detached()
 
 

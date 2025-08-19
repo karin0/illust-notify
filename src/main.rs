@@ -327,6 +327,23 @@ impl Callback {
     }
 }
 
+#[cfg(windows)]
+fn show_window(hide: bool) {
+    // Only works for conhost
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, ShowWindow};
+    unsafe {
+        let handle = GetConsoleWindow();
+        if handle.is_null() {
+            warn!("no console window");
+        } else {
+            let cmd = if hide { SW_HIDE } else { SW_SHOW };
+            let r = ShowWindow(handle, cmd);
+            info!("ShowWindow: {handle:?} {cmd:?} {r:?}");
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     pretty_env_logger::init_timed();
@@ -413,17 +430,25 @@ async fn main() -> Result<()> {
 
         pyo3::prepare_freethreaded_python();
 
-        let tx = rx.clone();
-        let exit = move |_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
-            warn!("exiting from tray");
-            tx.notify_waiters();
-        };
-
+        let tx_exit = rx.clone();
         let rx = Arc::new(Notify::new());
         let tx = rx.clone();
 
-        let notify = move |_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
-            tx.notify_waiters();
+        let callback = move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+            let arg = args
+                .get_item(0)
+                .ok()
+                .and_then(|v| v.extract::<i32>().ok())
+                .unwrap_or(0);
+            debug!("tray callback: {arg:?}");
+            match arg {
+                1 => tx.notify_waiters(),
+                #[cfg(windows)]
+                2 => show_window(true),
+                #[cfg(windows)]
+                3 => show_window(false),
+                _ => tx_exit.notify_waiters(),
+            }
         };
 
         Python::with_gil(|py| {
@@ -442,10 +467,8 @@ async fn main() -> Result<()> {
 
             path.call_method1("insert", (0, "."))?;
 
-            let exit = PyCFunction::new_closure(py, None, None, exit)?;
-            let notify = PyCFunction::new_closure(py, None, None, notify)?;
-
-            PyModule::import(py, "tray")?.call_method1("start", (exit, notify))?;
+            let callback = PyCFunction::new_closure(py, None, None, callback)?;
+            PyModule::import(py, "tray")?.call_method1("start", (callback,))?;
             PyResult::Ok(())
         })?;
         rx
@@ -456,18 +479,7 @@ async fn main() -> Result<()> {
 
     #[cfg(windows)]
     if daemon {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, SW_HIDE, ShowWindow,
-        };
-        unsafe {
-            let handle = GetForegroundWindow();
-            if handle.is_null() {
-                warn!("no foreground window found");
-            } else {
-                let r = ShowWindow(handle, SW_HIDE);
-                info!("hiding console window: {handle:?} {r:?}");
-            }
-        }
+        show_window(true);
     }
 
     loop {
