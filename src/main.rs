@@ -72,6 +72,8 @@ struct Config {
     max_pages: u32,
     #[serde(default = "default_min_skip_pages")]
     min_skip_pages: u32,
+    #[serde(default)]
+    archive: bool,
     #[cfg(feature = "request")]
     notify_url: Option<String>,
     #[cfg(feature = "tray")]
@@ -127,7 +129,6 @@ struct App {
     tz: UtcOffset,
     ago: timeago::Formatter,
     db: Connection,
-    archive: bool,
 }
 
 impl Deref for App {
@@ -148,7 +149,7 @@ const DATE_FORMAT: &[format_description::FormatItem<'static>] =
     format_description!("[month padding:none]/[day padding:none] [hour padding:none]:[minute]");
 
 impl App {
-    async fn new(refresh_token: &str, db: Connection, archive: bool) -> Result<Self> {
+    async fn new(refresh_token: &str, db: Connection) -> Result<Self> {
         Ok(Self {
             api: AuthedClient::new(refresh_token).await?,
             state: AppState::default(),
@@ -157,16 +158,10 @@ impl App {
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
             db,
-            archive,
         })
     }
 
-    fn load(
-        state: AppState,
-        api_state: AuthedState,
-        db: Connection,
-        archive: bool,
-    ) -> Result<Self> {
+    fn load(state: AppState, api_state: AuthedState, db: Connection) -> Result<Self> {
         Ok(Self {
             api: AuthedClient::load(api_state),
             state,
@@ -175,7 +170,6 @@ impl App {
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
             db,
-            archive,
         })
     }
 
@@ -352,16 +346,14 @@ async fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
     debug!("config: {config:#?}");
 
-    let archive_enabled = env::args().any(|s| s == "--archive" || s == "-a");
-
     let db_conn = Connection::open(DB_FILE)?;
     store::init_db(&db_conn)?;
 
     let mut app = match store::load_state(&db_conn) {
-        Ok((state, api_state)) => App::load(state, api_state, db_conn, archive_enabled)?,
+        Ok((state, api_state)) => App::load(state, api_state, db_conn)?,
         Err(e) => {
             warn!("load state from database: {e:#?}");
-            let app = App::new(&config.refresh_token, db_conn, archive_enabled).await?;
+            let app = App::new(&config.refresh_token, db_conn).await?;
             // Save initial state immediately so it exists in db
             store::save_state(&app.db, &app.state)?;
             store::save_token(&app.db, &app.api.state)?;
@@ -414,11 +406,8 @@ async fn main() -> Result<()> {
             }
             Ok(new_illusts) => {
                 debug!("refresh: illusts: {new_illusts:#?}");
-                if app.archive {
-                    let res = store::archive_illusts(&app.db, &new_illusts);
-                    if let Err(e) = res {
-                        error!("archive failed: {e:#?}");
-                    }
+                if config.archive {
+                    store::archive_illusts(&app.db, &new_illusts)?;
                 }
                 let since = app.since();
                 let ago = app.since_ago();
