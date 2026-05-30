@@ -425,7 +425,7 @@ async fn main() -> Result<()> {
                     info!("{status}");
 
                     #[cfg(feature = "tray")]
-                    if let Err(e) = Python::with_gil(|py| {
+                    if let Err(e) = Python::attach(|py| {
                         PyModule::import(py, "tray")?
                             .getattr("update")?
                             .call1((app.dist(),))?;

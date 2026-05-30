@@ -28,7 +28,7 @@ async fn run(
     use pyo3::prelude::*;
     use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<i32>(16);
 
@@ -42,7 +42,7 @@ async fn run(
         let _ = event_tx.blocking_send(arg);
     };
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let sys = py.import("sys")?;
         let version = sys.getattr("version")?;
         info!("Python: {version}");

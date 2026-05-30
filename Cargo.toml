@@ -39,13 +39,13 @@ notify = { version = "8", optional = true }
 itoa = "1.0"
 pretty_env_logger = { git = "https://github.com/karin0/pretty-env-logger.git" }
 pixiv = { git = "https://github.com/karin0/pvg-rs.git" }
-timeago = { version = "0.5", default-features = false }
-reqwest = { version = "0.12", default-features = false, optional = true }
-pyo3 = { version = "0.25", optional = true }
+timeago = { version = "0.6", default-features = false }
+reqwest = { version = "0.13", default-features = false, optional = true }
+pyo3 = { version = "0.28", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Console",
 ] }
