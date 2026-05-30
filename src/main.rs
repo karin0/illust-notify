@@ -333,7 +333,7 @@ impl Callback {
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    pretty_env_logger::init_timed();
+    pretty_env_logger::init();
 
     let mut args = env::args();
     args.next();
