@@ -154,21 +154,34 @@ pub fn extend_seen(conn: &Connection, ids: &BTreeSet<IllustId>) -> Result<()> {
     Ok(())
 }
 
-pub fn archive_illust(
+pub fn archive_illusts(
     conn: &Connection,
-    id: IllustId,
-    illust_val: &serde_json::Value,
+    illusts: &[(IllustId, Box<serde_json::value::RawValue>)],
 ) -> Result<()> {
+    if illusts.is_empty() {
+        return Ok(());
+    }
+
     let now = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Iso8601::DEFAULT)?;
 
-    let data_str = serde_json::to_string(illust_val)?;
+    let mut sql = String::from("INSERT OR REPLACE INTO Illust (id, data, archived_at) VALUES ");
+    for i in 0..illusts.len() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?)");
+    }
 
-    conn.execute(
-        "INSERT OR REPLACE INTO Illust (id, data, archived_at)
-         VALUES (?, ?, ?)",
-        params![id, data_str, now],
-    )?;
+    let data_slices: Vec<&str> = illusts.iter().map(|(_, raw)| raw.get()).collect();
 
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(illusts.len() * 3);
+    for (i, (id, _)) in illusts.iter().enumerate() {
+        params.push(id);
+        params.push(&data_slices[i]);
+        params.push(&now);
+    }
+
+    conn.execute(&sql, rusqlite::params_from_iter(params))?;
     Ok(())
 }

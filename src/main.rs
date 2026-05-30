@@ -36,6 +36,9 @@ mod notify;
 #[cfg(feature = "tray")]
 mod tray;
 
+#[cfg(feature = "hook")]
+pub(crate) mod hook;
+
 fn default_delay() -> u32 {
     300
 }
@@ -73,6 +76,8 @@ struct Config {
     notify_url: Option<String>,
     #[cfg(feature = "tray")]
     python_site_packages: Option<String>,
+    #[cfg(feature = "hook")]
+    hook: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -81,8 +86,8 @@ struct ImageUrls {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub(crate) struct Illust {
-    pub(crate) id: IllustId,
+struct Illust {
+    id: IllustId,
     title: String,
     create_date: String,
     is_bookmarked: bool,
@@ -91,7 +96,7 @@ pub(crate) struct Illust {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Page {
-    illusts: Vec<serde_json::Value>,
+    illusts: Vec<Box<serde_json::value::RawValue>>,
     next_url: Option<String>,
 }
 
@@ -193,7 +198,10 @@ impl App {
         self.ago.convert(d.unsigned_abs())
     }
 
-    async fn refresh(&mut self, config: &Config) -> Result<()> {
+    async fn refresh(
+        &mut self,
+        config: &Config,
+    ) -> Result<Vec<(IllustId, Box<serde_json::value::RawValue>)>> {
         if self.api.ensure_authed().await? {
             store::save_token(&self.db, &self.api.state)?;
         }
@@ -201,21 +209,12 @@ impl App {
 
         let mut pn = 1;
         let mut ids = BTreeSet::new();
+        let mut new_illusts = Vec::new();
         loop {
             debug!("page {} has {} illusts", pn, r.illusts.len());
             let mut may_skip = pn >= config.min_skip_pages;
             for illust_val in r.illusts {
-                let id: IllustId = illust_val
-                    .get("id")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("missing id"))?
-                    .try_into()?;
-
-                if self.archive {
-                    store::archive_illust(&self.db, id, &illust_val)?;
-                }
-
-                let illust: Illust = serde_json::from_value(illust_val)?;
+                let illust: Illust = serde_json::from_str(illust_val.get())?;
 
                 if illust.is_bookmarked {
                     debug!("bookmarked: {illust:#?}");
@@ -245,8 +244,13 @@ impl App {
                     self.remain = false;
                     self.skip = false;
                     store::reset_seen(&self.db, &ids)?;
-                    return Ok(());
+                    return Ok(new_illusts);
                 }
+
+                if !store::is_seen(&self.db, illust.id).unwrap_or(false) {
+                    new_illusts.push((illust.id, illust_val));
+                }
+
                 ids.insert(illust.id);
                 if may_skip && !store::is_seen(&self.db, illust.id).unwrap_or(false) {
                     may_skip = false;
@@ -258,7 +262,7 @@ impl App {
                     self.skip = true;
                 }
                 store::extend_seen(&self.db, &ids)?;
-                return Ok(());
+                return Ok(new_illusts);
             }
             if let Some(url) = r.next_url {
                 if pn >= config.max_pages {
@@ -277,7 +281,7 @@ impl App {
                 self.skip = false;
             }
             store::extend_seen(&self.db, &ids)?;
-            return Ok(());
+            return Ok(new_illusts);
         }
     }
 
@@ -399,67 +403,85 @@ async fn main() -> Result<()> {
         rx.clone(),
         config.python_site_packages.clone(),
     );
-
     let delay = Duration::from_secs(config.delay.into());
     let mut token = Default::default();
 
     loop {
-        if let Err(e) = app.refresh(&config).await {
-            error!("refresh failed: {e:#?}");
-            token = Default::default();
-        } else {
-            let since = app.since();
-            let ago = app.since_ago();
-            if token != app.token() {
-                token = app.token();
-                info!(
-                    "{}{}{} illusts since {} ({}, {})",
-                    if app.remain { "> " } else { "" },
-                    if app.skip { "~ " } else { "" },
-                    app.dist(),
-                    since,
-                    ago,
-                    app.iid
-                );
-
-                #[cfg(feature = "tray")]
-                if let Err(e) = Python::with_gil(|py| {
-                    PyModule::import(py, "tray")?
-                        .getattr("update")?
-                        .call1((app.dist(),))?;
-                    PyResult::Ok(())
-                }) {
-                    error!("tray: {e:#?}");
-                }
-
-                #[cfg(feature = "request")]
-                if let Some((client, url)) = &request {
-                    let url = format!("{url}/{}", app.dist());
-                    match client.get(&url).send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            if !status.is_success() {
-                                error!("request: {status}: {}", resp.text().await?);
-                            }
-                        }
-                        Err(e) => error!("send request: {e:#?}"),
+        match app.refresh(&config).await {
+            Err(e) => {
+                error!("refresh failed: {e:#?}");
+                token = Default::default();
+            }
+            Ok(new_illusts) => {
+                debug!("refresh: illusts: {new_illusts:#?}");
+                if app.archive {
+                    let res = store::archive_illusts(&app.db, &new_illusts);
+                    if let Err(e) = res {
+                        error!("archive failed: {e:#?}");
                     }
                 }
-            }
+                let since = app.since();
+                let ago = app.since_ago();
+                if token != app.token() {
+                    token = app.token();
+                    let status = format!(
+                        "{}{}{} illusts since {} ({}, {})",
+                        if app.remain { "> " } else { "" },
+                        if app.skip { "~ " } else { "" },
+                        app.dist(),
+                        since,
+                        ago,
+                        app.iid
+                    );
+                    info!("{status}");
 
-            #[cfg(feature = "callback")]
-            if let Some(cb) = &mut callback {
-                let args = &[
-                    cb.itoa.format(app.dist()),
-                    cb.itoa2.format(app.iid),
-                    &app.since(),
-                    &ago,
-                    if app.remain { "1" } else { "0" },
-                    if app.skip { "1" } else { "0" },
-                ];
+                    #[cfg(feature = "tray")]
+                    if let Err(e) = Python::with_gil(|py| {
+                        PyModule::import(py, "tray")?
+                            .getattr("update")?
+                            .call1((app.dist(),))?;
+                        PyResult::Ok(())
+                    }) {
+                        error!("tray: {e:#?}");
+                    }
 
-                if let Err(e) = do_callback(CALLBACK_FILE, args) {
-                    error!("callback: {e:#?}");
+                    #[cfg(feature = "request")]
+                    if let Some((client, url)) = &request {
+                        let url = format!("{url}/{}", app.dist());
+                        match client.get(&url).send().await {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                if !status.is_success() {
+                                    error!("request: {status}: {}", resp.text().await?);
+                                }
+                            }
+                            Err(e) => error!("send request: {e:#?}"),
+                        }
+                    }
+
+                    #[cfg(feature = "hook")]
+                    if let Some(ref url) = config.hook
+                        && !new_illusts.is_empty()
+                        && let Err(e) = hook::send_illusts(url, &new_illusts, &status).await
+                    {
+                        error!("hook: {e:#?}");
+                    }
+                }
+
+                #[cfg(feature = "callback")]
+                if let Some(cb) = &mut callback {
+                    let args = &[
+                        cb.itoa.format(app.dist()),
+                        cb.itoa2.format(app.iid),
+                        &app.since(),
+                        &ago,
+                        if app.remain { "1" } else { "0" },
+                        if app.skip { "1" } else { "0" },
+                    ];
+
+                    if let Err(e) = do_callback(CALLBACK_FILE, args) {
+                        error!("callback: {e:#?}");
+                    }
                 }
             }
         }
