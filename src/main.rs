@@ -242,7 +242,7 @@ impl App {
                     warn!("skipping from page {pn}");
                     self.skip = true;
                 }
-                self.vis.extend(ids.into_iter());
+                self.vis.extend(ids);
                 return Ok(());
             }
             if let Some(url) = r.next_url {
@@ -261,7 +261,7 @@ impl App {
                 self.remain = false;
                 self.skip = false;
             }
-            self.vis.extend(ids.into_iter());
+            self.vis.extend(ids);
             return Ok(());
         }
     }
