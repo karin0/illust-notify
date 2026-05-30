@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
 
+mod store;
+
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -10,6 +12,7 @@ use anyhow::Result;
 use pixiv::aapi::Restrict;
 use pixiv::client::{AuthedClient, AuthedState};
 use pixiv::model::IllustId;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset, format_description, macros::format_description};
 use tokio::sync::Notify;
@@ -44,7 +47,7 @@ fn default_min_skip_pages() -> u32 {
 }
 
 const CONFIG_FILE: &str = "config.json";
-const STATE_FILE: &str = "state.json";
+const DB_FILE: &str = "state.db";
 
 #[cfg(feature = "callback")]
 const CALLBACK_FILE: &str = "./callback";
@@ -76,8 +79,8 @@ struct ImageUrls {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-struct Illust {
-    id: IllustId,
+pub(crate) struct Illust {
+    pub(crate) id: IllustId,
     title: String,
     create_date: String,
     is_bookmarked: bool,
@@ -86,17 +89,16 @@ struct Illust {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Page {
-    illusts: Vec<Illust>,
+    illusts: Vec<serde_json::Value>,
     next_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-struct AppState {
-    iid: IllustId,
-    since: OffsetDateTime,
+pub(crate) struct AppState {
+    pub(crate) iid: IllustId,
+    pub(crate) since: OffsetDateTime,
     remain: bool,
     skip: bool,
-    vis: BTreeSet<IllustId>,
 }
 
 impl Default for AppState {
@@ -106,16 +108,8 @@ impl Default for AppState {
             since: OffsetDateTime::UNIX_EPOCH,
             remain: false,
             skip: false,
-            vis: BTreeSet::new(),
         }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-struct AppDump {
-    api: AuthedState,
-    #[serde(flatten)]
-    state: AppState,
 }
 
 struct App {
@@ -125,6 +119,8 @@ struct App {
     downloader: DownloadClient,
     tz: UtcOffset,
     ago: timeago::Formatter,
+    db: Connection,
+    archive: bool,
 }
 
 impl Deref for App {
@@ -145,7 +141,7 @@ const DATE_FORMAT: &[format_description::FormatItem<'static>] =
     format_description!("[month padding:none]/[day padding:none] [hour padding:none]:[minute]");
 
 impl App {
-    async fn new(refresh_token: &str) -> Result<Self> {
+    async fn new(refresh_token: &str, db: Connection, archive: bool) -> Result<Self> {
         Ok(Self {
             api: AuthedClient::new(refresh_token).await?,
             state: AppState::default(),
@@ -153,25 +149,27 @@ impl App {
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
+            db,
+            archive,
         })
     }
 
-    fn load(dump: AppDump) -> Result<Self> {
+    fn load(
+        state: AppState,
+        api_state: AuthedState,
+        db: Connection,
+        archive: bool,
+    ) -> Result<Self> {
         Ok(Self {
-            api: AuthedClient::load(dump.api),
-            state: dump.state,
+            api: AuthedClient::load(api_state),
+            state,
             #[cfg(feature = "download")]
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
+            db,
+            archive,
         })
-    }
-
-    fn dump(self) -> AppDump {
-        AppDump {
-            api: self.api.state,
-            state: self.state,
-        }
     }
 
     fn convert_date(&self, date: &str) -> Result<OffsetDateTime> {
@@ -194,7 +192,9 @@ impl App {
     }
 
     async fn refresh(&mut self, config: &Config) -> Result<()> {
-        self.api.ensure_authed().await?;
+        if self.api.ensure_authed().await? {
+            store::save_token(&self.db, &self.api.state)?;
+        }
         let mut r: Page = self.api.illust_follow(Restrict::Public).await?;
 
         let mut pn = 1;
@@ -202,7 +202,19 @@ impl App {
         loop {
             debug!("page {} has {} illusts", pn, r.illusts.len());
             let mut may_skip = pn >= config.min_skip_pages;
-            for illust in r.illusts {
+            for illust_val in r.illusts {
+                let id: IllustId = illust_val
+                    .get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing id"))?
+                    .try_into()?;
+
+                if self.archive {
+                    store::archive_illust(&self.db, id, &illust_val)?;
+                }
+
+                let illust: Illust = serde_json::from_value(illust_val)?;
+
                 if illust.is_bookmarked {
                     debug!("bookmarked: {illust:#?}");
                     if self.iid != illust.id {
@@ -226,14 +238,15 @@ impl App {
                         }
 
                         self.iid = illust.id;
+                        store::save_state(&self.db, &self.state)?;
                     }
                     self.remain = false;
                     self.skip = false;
-                    self.vis = ids;
+                    store::reset_seen(&self.db, &ids)?;
                     return Ok(());
                 }
                 ids.insert(illust.id);
-                if may_skip && !self.vis.contains(&illust.id) {
+                if may_skip && !store::is_seen(&self.db, illust.id).unwrap_or(false) {
                     may_skip = false;
                 }
             }
@@ -242,7 +255,7 @@ impl App {
                     warn!("skipping from page {pn}");
                     self.skip = true;
                 }
-                self.vis.extend(ids);
+                store::extend_seen(&self.db, &ids)?;
                 return Ok(());
             }
             if let Some(url) = r.next_url {
@@ -261,13 +274,13 @@ impl App {
                 self.remain = false;
                 self.skip = false;
             }
-            self.vis.extend(ids);
+            store::extend_seen(&self.db, &ids)?;
             return Ok(());
         }
     }
 
     fn dist(&self) -> usize {
-        self.vis.len()
+        store::get_seen_count(&self.db).unwrap_or(0)
     }
 
     fn token(&self) -> (IllustId, usize) {
@@ -284,16 +297,6 @@ fn do_callback(bin: &str, args: &[&str]) -> Result<()> {
     } else {
         anyhow::bail!("callback returned {:?}", r.code());
     }
-    Ok(())
-}
-
-fn load_state(path: &str) -> Result<App> {
-    App::load(serde_json::from_str(&fs::read_to_string(path)?)?)
-}
-
-fn bye(app: App) -> Result<()> {
-    info!("dumping state");
-    fs::write(STATE_FILE, serde_json::to_string_pretty(&app.dump())?)?;
     Ok(())
 }
 
@@ -344,6 +347,7 @@ fn show_window(hide: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     pretty_env_logger::init_timed();
@@ -365,11 +369,20 @@ async fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
     debug!("config: {config:#?}");
 
-    let mut app = match load_state(STATE_FILE) {
-        Ok(app) => app,
+    let archive_enabled = env::args().any(|s| s == "--archive" || s == "-a");
+
+    let db_conn = Connection::open(DB_FILE)?;
+    store::init_db(&db_conn)?;
+
+    let mut app = match store::load_state(&db_conn) {
+        Ok((state, api_state)) => App::load(state, api_state, db_conn, archive_enabled)?,
         Err(e) => {
-            warn!("load state: {e:#?}");
-            App::new(&config.refresh_token).await?
+            warn!("load state from database: {e:#?}");
+            let app = App::new(&config.refresh_token, db_conn, archive_enabled).await?;
+            // Save initial state immediately so it exists in db
+            store::save_state(&app.db, &app.state)?;
+            store::save_token(&app.db, &app.api.state)?;
+            app
         }
     };
 
@@ -578,14 +591,14 @@ async fn main() -> Result<()> {
             token,
             () = sleep(delay) => {},
             () = rx.notified() => {
-                return bye(app);
+                return Ok(());
             },
             "inotify": r = inotify.next() => {
                 if let Some(Ok(event)) = r {
                     debug!("inotify: {event:#?}");
                 } else {
                     error!("inotify: {r:#?}");
-                    return bye(app);
+                    return Ok(());
                 }
             },
             "notify": r = notify.recv() => {
@@ -593,7 +606,7 @@ async fn main() -> Result<()> {
                     debug!("notify got: {event:#?}");
                 } else {
                     error!("notify closed");
-                    return bye(app);
+                    return Ok(());
                 }
             },
             "tray": () = tray_rx.notified() => {}
