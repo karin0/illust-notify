@@ -382,6 +382,17 @@ impl Callback {
     }
 }
 
+async fn finalize_http(resp: reqwest::Response) {
+    let st = resp.status();
+    debug!("http status: {st}");
+    if !st.is_success() {
+        match resp.text().await {
+            Ok(body) => error!("http failed: {st}: {body}"),
+            Err(e) => error!("http failed: {st}, text: {e:#?}"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -422,13 +433,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "callback")]
     let mut callback = Callback::new();
 
-    #[cfg(feature = "request")]
-    let request = config
-        .notify_url
-        .as_ref()
-        .map(|url| (reqwest::Client::new(), url));
-
-    let hook_client = reqwest::Client::new();
+    let http = reqwest::Client::new();
 
     let fetcher = config
         .pix_dir
@@ -498,23 +503,18 @@ async fn main() -> Result<()> {
                     }
 
                     #[cfg(feature = "request")]
-                    if let Some((client, url)) = &request {
+                    if let Some(ref url) = config.notify_url {
                         let url = format!("{url}/{}", app.dist);
-                        match client.get(&url).send().await {
-                            Ok(resp) => {
-                                let status = resp.status();
-                                if !status.is_success() {
-                                    error!("request: {status}: {}", resp.text().await?);
-                                }
-                            }
-                            Err(e) => error!("send request: {e:#?}"),
+                        match http.get(&url).send().await {
+                            Ok(resp) => finalize_http(resp).await,
+                            Err(e) => error!("request: {e:#?}"),
                         }
                     }
                 }
 
                 // Outside the token check: metadata updates don't move (iid, dist).
                 for url in &config.hooks {
-                    if let Err(e) = hook::send_illusts(&hook_client, url, &illusts, &app).await {
+                    if let Err(e) = hook::send_illusts(&http, url, &illusts, &app).await {
                         error!("hook {url}: {e:#?}");
                     }
                 }
