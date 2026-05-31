@@ -1,21 +1,39 @@
+use crate::{App, Item};
 use anyhow::Result;
-use log::debug;
+use log::{debug, error};
+use serde_json::{Value, json};
 
-pub async fn send_illusts<T>(
-    url: &str,
-    illusts: &[(T, Box<serde_json::value::RawValue>)],
-    status: &str,
-) -> Result<()> {
-    debug!("hook: sending {} new illusts to {url}", illusts.len());
+pub async fn send_illusts(url: &str, illusts: &[Item], app: &App) -> Result<()> {
+    let n = illusts.len();
+    let illusts: Vec<_> = illusts
+        .iter()
+        .filter(|item| item.new)
+        .map(|item| item.data.get())
+        .collect();
+    debug!(
+        "hook: sending {} new illusts (out of {n}) to {url}",
+        illusts.len()
+    );
+    if illusts.is_empty() {
+        return Ok(());
+    }
+
+    let status = json!({
+        "dist": app.dist,
+        "iid": app.iid,
+        "since": app.since.unix_timestamp(),
+        "since_ago": app.since_ago(),
+        "remain": app.remain,
+        "skip": app.skip,
+    });
 
     let mut payloads = Vec::with_capacity(std::cmp::min(illusts.len(), 10));
-    for (_, raw) in illusts.iter().take(10).rev() {
-        let mut value: serde_json::Value = serde_json::from_str(raw.get())?;
+    for data in illusts.into_iter().take(10).rev() {
+        let mut value: Value = serde_json::from_str(data)?;
         if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "status".to_string(),
-                serde_json::Value::String(status.to_string()),
-            );
+            obj.insert("_illust_notify".into(), status.clone());
+        } else {
+            error!("hook: bad value: {data}");
         }
         payloads.push(value);
     }

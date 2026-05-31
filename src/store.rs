@@ -1,9 +1,8 @@
-use crate::AppState;
+use crate::{AppState, Item};
 use anyhow::Result;
 use pixiv::client::AuthedState;
 use pixiv::model::IllustId;
 use rusqlite::{Connection, params};
-use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
@@ -122,42 +121,42 @@ pub fn get_seen_count(conn: &Connection) -> Result<usize> {
     Ok(count)
 }
 
-pub fn reset_seen(conn: &Connection, ids: &BTreeSet<IllustId>) -> Result<()> {
+pub fn reset_seen(conn: &Connection, ids: impl Iterator<Item = IllustId>) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
 
     tx.execute("DELETE FROM Seen", [])?;
 
+    let mut inserted = 0;
     {
         let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO Seen (illust_id) VALUES (?)")?;
 
-        for &id in ids {
-            stmt.execute(params![id])?;
+        for id in ids {
+            inserted += stmt.execute(params![id])?;
         }
     }
 
     tx.commit()?;
-    Ok(())
+    Ok(inserted)
 }
 
-pub fn extend_seen(conn: &Connection, ids: &BTreeSet<IllustId>) -> Result<()> {
+pub fn extend_seen(conn: &Connection, ids: impl Iterator<Item = IllustId>) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
 
+    let mut inserted = 0;
     {
         let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO Seen (illust_id) VALUES (?)")?;
 
-        for &id in ids {
-            stmt.execute(params![id])?;
+        for id in ids {
+            inserted += stmt.execute(params![id])?;
         }
     }
 
     tx.commit()?;
-    Ok(())
+    Ok(inserted)
 }
 
-pub fn archive_illusts(
-    conn: &Connection,
-    illusts: &[(IllustId, Box<serde_json::value::RawValue>)],
-) -> Result<()> {
+pub fn archive_illusts(conn: &Connection, illusts: &[Item]) -> Result<()> {
+    debug!("archiving {} illusts", illusts.len());
     if illusts.is_empty() {
         return Ok(());
     }
@@ -165,23 +164,18 @@ pub fn archive_illusts(
     let now = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Iso8601::DEFAULT)?;
 
-    let mut sql = String::from("INSERT OR REPLACE INTO Illust (id, data, archived_at) VALUES ");
-    for i in 0..illusts.len() {
-        if i > 0 {
-            sql.push_str(", ");
+    let tx = conn.unchecked_transaction()?;
+
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO Illust (id, data, archived_at) VALUES (?, ?, ?)",
+        )?;
+
+        for item in illusts {
+            stmt.execute(params![item.iid, item.data.get(), now])?;
         }
-        sql.push_str("(?, ?, ?)");
     }
 
-    let data_slices: Vec<&str> = illusts.iter().map(|(_, raw)| raw.get()).collect();
-
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(illusts.len() * 3);
-    for (i, (id, _)) in illusts.iter().enumerate() {
-        params.push(id);
-        params.push(&data_slices[i]);
-        params.push(&now);
-    }
-
-    conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    tx.commit()?;
     Ok(())
 }

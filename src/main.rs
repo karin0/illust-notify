@@ -3,7 +3,6 @@ extern crate log;
 
 mod store;
 
-use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::{env, fs};
@@ -103,9 +102,9 @@ struct Page {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub(crate) struct AppState {
-    pub(crate) iid: IllustId,
-    pub(crate) since: OffsetDateTime,
+struct AppState {
+    iid: IllustId,
+    since: OffsetDateTime,
     remain: bool,
     skip: bool,
 }
@@ -129,6 +128,7 @@ struct App {
     tz: UtcOffset,
     ago: timeago::Formatter,
     db: Connection,
+    dist: usize,
 }
 
 impl Deref for App {
@@ -148,6 +148,14 @@ impl DerefMut for App {
 const DATE_FORMAT: &[format_description::FormatItem<'static>] =
     format_description!("[month padding:none]/[day padding:none] [hour padding:none]:[minute]");
 
+#[derive(Debug)]
+struct Item {
+    iid: IllustId,
+    data: Box<serde_json::value::RawValue>,
+    #[allow(dead_code)]
+    new: bool,
+}
+
 impl App {
     async fn new(refresh_token: &str, db: Connection) -> Result<Self> {
         Ok(Self {
@@ -157,6 +165,7 @@ impl App {
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
+            dist: store::get_seen_count(&db)?,
             db,
         })
     }
@@ -169,6 +178,7 @@ impl App {
             downloader: DownloadClient::new(),
             tz: UtcOffset::current_local_offset()?,
             ago: timeago::Formatter::new(),
+            dist: store::get_seen_count(&db)?,
             db,
         })
     }
@@ -192,24 +202,57 @@ impl App {
         self.ago.convert(d.unsigned_abs())
     }
 
-    async fn refresh(
-        &mut self,
-        config: &Config,
-    ) -> Result<Vec<(IllustId, Box<serde_json::value::RawValue>)>> {
+    fn ids(&self, illusts: &[Item]) -> impl Iterator<Item = IllustId> {
+        illusts
+            .iter()
+            .map(|item| item.iid)
+            .take_while(|&id| id != self.iid)
+    }
+
+    fn extend_seen(&mut self, illusts: &[Item]) -> Result<()> {
+        self.dist += store::extend_seen(&self.db, self.ids(illusts))?;
+        Ok(())
+    }
+
+    fn reset_seen(&mut self, illusts: &[Item]) -> Result<()> {
+        self.dist = store::reset_seen(&self.db, self.ids(illusts))?;
+        Ok(())
+    }
+
+    async fn ensure_authed(&mut self) -> Result<()> {
         if self.api.ensure_authed().await? {
             store::save_token(&self.db, &self.api.state)?;
         }
+        Ok(())
+    }
+
+    async fn refresh(&mut self, config: &Config) -> Result<Vec<Item>> {
+        self.ensure_authed().await?;
         let mut r: Page = self.api.illust_follow(Restrict::Public).await?;
 
         let mut pn = 1;
-        let mut ids = BTreeSet::new();
-        let mut new_illusts = Vec::new();
+        let mut result = Vec::with_capacity(30 * config.min_skip_pages as usize);
+
         loop {
             debug!("page {} has {} illusts", pn, r.illusts.len());
             let mut may_skip = pn >= config.min_skip_pages;
-            for illust_val in r.illusts {
-                let illust: Illust = serde_json::from_str(illust_val.get())?;
+            let mut done = false;
+            for data in r.illusts {
+                if done {
+                    #[derive(Deserialize)]
+                    struct Id {
+                        id: IllustId,
+                    }
+                    let id: Id = serde_json::from_str(data.get())?;
+                    result.push(Item {
+                        iid: id.id,
+                        data,
+                        new: false,
+                    });
+                    continue;
+                }
 
+                let illust: Illust = serde_json::from_str(data.get())?;
                 if illust.is_bookmarked {
                     debug!("bookmarked: {illust:#?}");
                     if self.iid != illust.id {
@@ -235,36 +278,43 @@ impl App {
                         self.iid = illust.id;
                         store::save_state(&self.db, &self.state)?;
                     }
-                    self.remain = false;
-                    self.skip = false;
-                    store::reset_seen(&self.db, &ids)?;
-                    return Ok(new_illusts);
+                    done = true;
+                    result.push(Item {
+                        iid: illust.id,
+                        data,
+                        new: false,
+                    });
+                    continue;
                 }
 
-                if !store::is_seen(&self.db, illust.id).unwrap_or(false) {
-                    new_illusts.push((illust.id, illust_val));
-                }
-
-                ids.insert(illust.id);
-                if may_skip && !store::is_seen(&self.db, illust.id).unwrap_or(false) {
+                let new = !store::is_seen(&self.db, illust.id)?;
+                result.push(Item {
+                    iid: illust.id,
+                    data,
+                    new,
+                });
+                if new {
                     may_skip = false;
                 }
             }
-            if may_skip {
+
+            if done {
+                self.remain = false;
+                self.skip = false;
+                self.reset_seen(&result)?;
+            } else if may_skip {
                 if !self.skip {
                     warn!("skipping from page {pn}");
                     self.skip = true;
                 }
-                store::extend_seen(&self.db, &ids)?;
-                return Ok(new_illusts);
-            }
-            if let Some(url) = r.next_url {
+            } else if let Some(url) = r.next_url {
                 if pn >= config.max_pages {
                     if !self.remain {
                         warn!("reached max pages {pn}");
                         self.remain = true;
                     }
                 } else {
+                    self.ensure_authed().await?;
                     r = self.api.call_url(&url).await?;
                     pn += 1;
                     continue;
@@ -274,17 +324,13 @@ impl App {
                 self.remain = false;
                 self.skip = false;
             }
-            store::extend_seen(&self.db, &ids)?;
-            return Ok(new_illusts);
+            self.extend_seen(&result)?;
+            return Ok(result);
         }
     }
 
-    fn dist(&self) -> usize {
-        store::get_seen_count(&self.db).unwrap_or(0)
-    }
-
     fn token(&self) -> (IllustId, usize) {
-        (self.iid, self.dist())
+        (self.iid, self.dist)
     }
 }
 
@@ -404,31 +450,30 @@ async fn main() -> Result<()> {
                 error!("refresh failed: {e:#?}");
                 token = Default::default();
             }
-            Ok(new_illusts) => {
-                debug!("refresh: illusts: {new_illusts:#?}");
+            Ok(illusts) => {
+                debug!("refresh: {} illusts", illusts.len());
                 if config.archive {
-                    store::archive_illusts(&app.db, &new_illusts)?;
+                    store::archive_illusts(&app.db, &illusts)?;
                 }
                 let since = app.since();
                 let ago = app.since_ago();
                 if token != app.token() {
                     token = app.token();
-                    let status = format!(
+                    info!(
                         "{}{}{} illusts since {} ({}, {})",
                         if app.remain { "> " } else { "" },
                         if app.skip { "~ " } else { "" },
-                        app.dist(),
+                        app.dist,
                         since,
                         ago,
                         app.iid
                     );
-                    info!("{status}");
 
                     #[cfg(feature = "tray")]
                     if let Err(e) = Python::attach(|py| {
                         PyModule::import(py, "tray")?
                             .getattr("update")?
-                            .call1((app.dist(),))?;
+                            .call1((app.dist,))?;
                         PyResult::Ok(())
                     }) {
                         error!("tray: {e:#?}");
@@ -436,7 +481,7 @@ async fn main() -> Result<()> {
 
                     #[cfg(feature = "request")]
                     if let Some((client, url)) = &request {
-                        let url = format!("{url}/{}", app.dist());
+                        let url = format!("{url}/{}", app.dist);
                         match client.get(&url).send().await {
                             Ok(resp) => {
                                 let status = resp.status();
@@ -450,8 +495,7 @@ async fn main() -> Result<()> {
 
                     #[cfg(feature = "hook")]
                     if let Some(ref url) = config.hook
-                        && !new_illusts.is_empty()
-                        && let Err(e) = hook::send_illusts(url, &new_illusts, &status).await
+                        && let Err(e) = hook::send_illusts(url, &illusts, &app).await
                     {
                         error!("hook: {e:#?}");
                     }
@@ -460,7 +504,7 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "callback")]
                 if let Some(cb) = &mut callback {
                     let args = &[
-                        cb.itoa.format(app.dist()),
+                        cb.itoa.format(app.dist),
                         cb.itoa2.format(app.iid),
                         &app.since(),
                         &ago,
