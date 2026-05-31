@@ -21,18 +21,20 @@ use tokio::time::{Duration, sleep};
 #[cfg(feature = "download")]
 use pixiv::download::DownloadClient;
 
-#[cfg(feature = "inotify")]
-use futures::{FutureExt, StreamExt};
-
 #[cfg(feature = "tray")]
 use pyo3::prelude::*;
 
-#[cfg(any(
-    all(feature = "inotify", feature = "notify"),
-    all(feature = "inotify", feature = "tray"),
-    all(feature = "notify", feature = "tray")
-))]
-compile_error!("features conflict");
+#[cfg(all(feature = "inotify", feature = "notify"))]
+compile_error!("feature \"inotify\" and \"notify\" conflict");
+
+#[cfg(feature = "inotify")]
+mod inotify;
+
+#[cfg(feature = "notify")]
+mod notify;
+
+#[cfg(feature = "tray")]
+mod tray;
 
 fn default_delay() -> u32 {
     300
@@ -56,7 +58,7 @@ const CALLBACK_FILE: &str = "./callback";
 const IMG_FILE: &str = "img.jpg";
 
 #[cfg(any(feature = "inotify", feature = "notify"))]
-const NOTIFY_FILE: &str = "notify";
+pub(crate) const NOTIFY_FILE: &str = "notify";
 
 #[derive(Deserialize, Debug, Clone)]
 struct Config {
@@ -330,23 +332,6 @@ impl Callback {
     }
 }
 
-#[cfg(windows)]
-fn show_window(hide: bool) {
-    // Only works for conhost
-    use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, ShowWindow};
-    unsafe {
-        let handle = GetConsoleWindow();
-        if handle.is_null() {
-            warn!("no console window");
-        } else {
-            let cmd = if hide { SW_HIDE } else { SW_SHOW };
-            let r = ShowWindow(handle, cmd);
-            info!("ShowWindow: {handle:?} {cmd:?} {r:?}");
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -358,14 +343,8 @@ async fn main() -> Result<()> {
         env::set_current_dir(&dir)?;
     }
 
-    #[cfg(windows)]
-    let daemon = args.any(|s| s == "-d");
     drop(args);
 
-    #[cfg(feature = "tray")]
-    let mut config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
-
-    #[cfg(not(feature = "tray"))]
     let config: Config = serde_json::from_str(&fs::read_to_string(CONFIG_FILE)?)?;
     debug!("config: {config:#?}");
 
@@ -389,37 +368,8 @@ async fn main() -> Result<()> {
     #[cfg(any(feature = "inotify", feature = "notify"))]
     drop(fs::File::create(NOTIFY_FILE)?);
 
-    #[cfg(feature = "inotify")]
-    let mut buf = [0; 128];
-
-    #[cfg(feature = "inotify")]
-    let mut inotify = {
-        use inotify::{Inotify, WatchMask};
-        let inotify = Inotify::init()?;
-        inotify.watches().add(NOTIFY_FILE, WatchMask::OPEN)?;
-        inotify.into_event_stream(&mut buf)?
-    };
-
-    #[cfg(feature = "notify")]
-    let (_notify, mut notify) = {
-        use notify::{Event, RecursiveMode, Result, Watcher, recommended_watcher};
-
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let mut watcher = recommended_watcher(move |res: Result<Event>| match res {
-            Ok(event) => {
-                debug!("notify: {event:#?}");
-                futures::executor::block_on(async {
-                    if let Err(e) = tx.send(event).await {
-                        error!("send notify: {e:#?}");
-                    }
-                });
-            }
-            Err(e) => error!("notify: {e:#?}"),
-        })?;
-
-        watcher.watch(NOTIFY_FILE.as_ref(), RecursiveMode::NonRecursive)?;
-        (watcher, rx)
-    };
+    #[cfg(feature = "base-notify")]
+    let (wakeup_tx, mut wakeup_rx) = tokio::sync::mpsc::channel::<()>(16);
 
     #[cfg(feature = "callback")]
     let mut callback = Callback::new();
@@ -437,63 +387,21 @@ async fn main() -> Result<()> {
         tx.notify_waiters();
     })?;
 
+    #[cfg(feature = "inotify")]
+    inotify::spawn(wakeup_tx.clone());
+
+    #[cfg(feature = "notify")]
+    notify::spawn(wakeup_tx.clone());
+
     #[cfg(feature = "tray")]
-    let tray_rx = {
-        use pyo3::types::{PyCFunction, PyDict, PyTuple};
-
-        pyo3::prepare_freethreaded_python();
-
-        let tx_exit = rx.clone();
-        let rx = Arc::new(Notify::new());
-        let tx = rx.clone();
-
-        let callback = move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
-            let arg = args
-                .get_item(0)
-                .ok()
-                .and_then(|v| v.extract::<i32>().ok())
-                .unwrap_or(0);
-            debug!("tray callback: {arg:?}");
-            match arg {
-                1 => tx.notify_waiters(),
-                #[cfg(windows)]
-                2 => show_window(true),
-                #[cfg(windows)]
-                3 => show_window(false),
-                _ => tx_exit.notify_waiters(),
-            }
-        };
-
-        Python::with_gil(|py| {
-            let sys = py.import("sys")?;
-            let version = sys.getattr("version")?;
-            info!("Python: {version}");
-
-            let path = sys.getattr("path")?;
-
-            if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
-                let site_packages = format!("{venv}/Lib/site-packages");
-                path.call_method1("insert", (0, site_packages))?;
-            } else if let Some(python_site_packages) = config.python_site_packages.take() {
-                path.call_method1("insert", (0, python_site_packages))?;
-            }
-
-            path.call_method1("insert", (0, "."))?;
-
-            let callback = PyCFunction::new_closure(py, None, None, callback)?;
-            PyModule::import(py, "tray")?.call_method1("start", (callback,))?;
-            PyResult::Ok(())
-        })?;
-        rx
-    };
+    tray::spawn(
+        wakeup_tx.clone(),
+        rx.clone(),
+        config.python_site_packages.clone(),
+    );
 
     let delay = Duration::from_secs(config.delay.into());
     let mut token = Default::default();
-
-    #[cfg(windows)]
-    if daemon {
-        show_window(true);
-    }
 
     loop {
         if let Err(e) = app.refresh(&config).await {
@@ -556,60 +464,24 @@ async fn main() -> Result<()> {
             }
         }
 
-        #[cfg(feature = "inotify")]
-        while let Some(e) = inotify.next().now_or_never() {
-            debug!("inotify omiting: {e:#?}");
-        }
-
-        #[cfg(feature = "notify")]
-        while let Ok(event) = notify.try_recv() {
-            debug!("notify omitting: {event:#?}");
-        }
-
-        macro_rules! do_select {
-            (
-                $token:ident,
-                $res0:tt = $src0:expr => $body0:block,
-                $res1:tt = $src1:expr => $body1:block
-                $(, $feature:literal: $result:tt = $source:expr => $body:block)+
-            ) => {
-                $(
-                    #[cfg(feature = $feature)]
-                    tokio::select! {
-                        $res0 = $src0 => $body0,
-                        $res1 = $src1 => $body1,
-                        $result = $source => {
-                            $body
-                            $token = Default::default();
-                        }
-                    }
-                )+
-            };
-        }
-
-        do_select!(
-            token,
+        #[cfg(feature = "base-notify")]
+        tokio::select! {
             () = sleep(delay) => {},
             () = rx.notified() => {
-                return Ok(());
+                break;
             },
-            "inotify": r = inotify.next() => {
-                if let Some(Ok(event)) = r {
-                    debug!("inotify: {event:#?}");
-                } else {
-                    error!("inotify: {r:#?}");
-                    return Ok(());
-                }
-            },
-            "notify": r = notify.recv() => {
-                if let Some(event) = r {
-                    debug!("notify got: {event:#?}");
-                } else {
-                    error!("notify closed");
-                    return Ok(());
-                }
-            },
-            "tray": () = tray_rx.notified() => {}
-        );
+            Some(()) = wakeup_rx.recv() => {
+                token = Default::default();
+            }
+        }
+
+        #[cfg(not(feature = "base-notify"))]
+        tokio::select! {
+            () = sleep(delay) => {},
+            () = rx.notified() => {
+                break;
+            }
+        }
     }
+    Ok(())
 }

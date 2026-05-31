@@ -49,9 +49,10 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [features]
-tray = ["dep:pyo3"]
-inotify = ["dep:inotify"]
-notify = ["dep:notify"]
+base-notify = []
+tray = ["dep:pyo3", "base-notify"]
+inotify = ["dep:inotify", "base-notify"]
+notify = ["dep:notify", "base-notify"]
 request = ["dep:reqwest"]
 callback = []
 download = []
