@@ -109,6 +109,15 @@ pub fn save_token(conn: &Connection, api_state: &AuthedState) -> Result<()> {
     Ok(())
 }
 
+pub fn get_illust_data(conn: &Connection, id: IllustId) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached("SELECT data FROM Illust WHERE id = ?")?;
+    match stmt.query_row(params![id], |row| row.get::<_, String>(0)) {
+        Ok(data) => Ok(Some(data)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn is_seen(conn: &Connection, id: IllustId) -> Result<bool> {
     let mut stmt = conn.prepare_cached("SELECT 1 FROM Seen WHERE illust_id = ?")?;
     let exists = stmt.exists(params![id])?;

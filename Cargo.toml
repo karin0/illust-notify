@@ -40,7 +40,8 @@ itoa = "1.0"
 pretty_env_logger = { git = "https://github.com/karin0/pretty-env-logger.git" }
 pixiv = { git = "https://github.com/karin0/pvg-rs.git" }
 timeago = { version = "0.6", default-features = false }
-reqwest = { version = "0.13", default-features = false, optional = true }
+# Already present transitively via the pixiv crate.
+reqwest = { version = "0.13", default-features = false }
 pyo3 = { version = "0.28", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 
@@ -55,7 +56,6 @@ base-notify = []
 tray = ["dep:pyo3", "base-notify"]
 inotify = ["dep:inotify", "base-notify"]
 notify = ["dep:notify", "base-notify"]
-request = ["dep:reqwest"]
-hook = ["dep:reqwest"]
+request = []
 callback = []
 download = []

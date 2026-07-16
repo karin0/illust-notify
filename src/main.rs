@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate log;
 
+mod fetch;
 mod store;
 
 use std::ops::{Deref, DerefMut};
@@ -17,7 +18,6 @@ use time::{OffsetDateTime, UtcOffset, format_description, macros::format_descrip
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
 
-#[cfg(feature = "download")]
 use pixiv::download::DownloadClient;
 
 #[cfg(feature = "tray")]
@@ -35,7 +35,6 @@ mod notify;
 #[cfg(feature = "tray")]
 mod tray;
 
-#[cfg(feature = "hook")]
 pub(crate) mod hook;
 
 fn default_delay() -> u32 {
@@ -73,12 +72,15 @@ struct Config {
     min_skip_pages: u32,
     #[serde(default)]
     archive: bool,
+    /// Consumers of new/updated illusts; empty disables webhooks.
+    #[serde(default)]
+    hooks: Vec<String>,
+    /// Flat directory for archived p0 originals, named by URL basename.
+    pix_dir: Option<String>,
     #[cfg(feature = "request")]
     notify_url: Option<String>,
     #[cfg(feature = "tray")]
     python_site_packages: Option<String>,
-    #[cfg(feature = "hook")]
-    hook: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -152,8 +154,9 @@ const DATE_FORMAT: &[format_description::FormatItem<'static>] =
 struct Item {
     iid: IllustId,
     data: Box<serde_json::value::RawValue>,
-    #[allow(dead_code)]
     new: bool,
+    /// The p0 URL changed, or its missing file was just fetched (see fetch.rs).
+    updated: bool,
 }
 
 impl App {
@@ -248,6 +251,7 @@ impl App {
                         iid: id.id,
                         data,
                         new: false,
+                        updated: false,
                     });
                     continue;
                 }
@@ -283,6 +287,7 @@ impl App {
                         iid: illust.id,
                         data,
                         new: false,
+                        updated: false,
                     });
                     continue;
                 }
@@ -292,6 +297,7 @@ impl App {
                     iid: illust.id,
                     data,
                     new,
+                    updated: false,
                 });
                 if new {
                     may_skip = false;
@@ -422,6 +428,13 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|url| (reqwest::Client::new(), url));
 
+    let hook_client = reqwest::Client::new();
+
+    let fetcher = config
+        .pix_dir
+        .as_ref()
+        .map(|dir| (std::path::PathBuf::from(dir), DownloadClient::new()));
+
     let rx = Arc::new(Notify::new());
     let tx = rx.clone();
     ctrlc::set_handler(move || {
@@ -450,8 +463,13 @@ async fn main() -> Result<()> {
                 error!("refresh failed: {e:#?}");
                 token = Default::default();
             }
-            Ok(illusts) => {
+            Ok(mut illusts) => {
                 debug!("refresh: {} illusts", illusts.len());
+                // Before archiving (the URL diff needs the old metadata) and
+                // before hooks (files must land before the announcement).
+                if let Some((dir, dl)) = &fetcher {
+                    fetch::process(dl, dir, &app.db, &mut illusts).await;
+                }
                 if config.archive {
                     store::archive_illusts(&app.db, &illusts)?;
                 }
@@ -492,12 +510,12 @@ async fn main() -> Result<()> {
                             Err(e) => error!("send request: {e:#?}"),
                         }
                     }
+                }
 
-                    #[cfg(feature = "hook")]
-                    if let Some(ref url) = config.hook
-                        && let Err(e) = hook::send_illusts(url, &illusts, &app).await
-                    {
-                        error!("hook: {e:#?}");
+                // Outside the token check: metadata updates don't move (iid, dist).
+                for url in &config.hooks {
+                    if let Err(e) = hook::send_illusts(&hook_client, url, &illusts, &app).await {
+                        error!("hook {url}: {e:#?}");
                     }
                 }
 

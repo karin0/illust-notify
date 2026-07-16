@@ -3,15 +3,20 @@ use anyhow::Result;
 use log::{debug, error};
 use serde_json::{Value, json};
 
-pub async fn send_illusts(url: &str, illusts: &[Item], app: &App) -> Result<()> {
+pub async fn send_illusts(
+    client: &reqwest::Client,
+    url: &str,
+    illusts: &[Item],
+    app: &App,
+) -> Result<()> {
     let n = illusts.len();
     let illusts: Vec<_> = illusts
         .iter()
-        .filter(|item| item.new)
+        .filter(|item| item.new || item.updated)
         .map(|item| item.data.get())
         .collect();
     debug!(
-        "hook: sending {} new illusts (out of {n}) to {url}",
+        "hook: sending {} new/updated illusts (out of {n}) to {url}",
         illusts.len()
     );
     if illusts.is_empty() {
@@ -27,8 +32,8 @@ pub async fn send_illusts(url: &str, illusts: &[Item], app: &App) -> Result<()> 
         "skip": app.skip,
     });
 
-    let mut payloads = Vec::with_capacity(std::cmp::min(illusts.len(), 10));
-    for data in illusts.into_iter().take(10).rev() {
+    let mut payloads = Vec::with_capacity(illusts.len());
+    for data in illusts.into_iter().rev() {
         let mut value: Value = serde_json::from_str(data)?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("_illust_notify".into(), status.clone());
@@ -39,7 +44,6 @@ pub async fn send_illusts(url: &str, illusts: &[Item], app: &App) -> Result<()> 
     }
 
     let body_str = serde_json::to_string(&payloads)?;
-    let client = reqwest::Client::new();
     let response = client
         .post(url)
         .header("Content-Type", "application/json")
