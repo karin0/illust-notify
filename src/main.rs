@@ -8,7 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::{env, fs};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use pixiv::aapi::Restrict;
 use pixiv::client::{AuthedClient, AuthedState};
 use pixiv::model::IllustId;
@@ -63,13 +63,14 @@ pub(crate) const NOTIFY_FILE: &str = "notify";
 
 #[derive(Deserialize, Debug, Clone)]
 struct Config {
-    refresh_token: String,
+    refresh_token: Option<String>,
     #[serde(default = "default_delay")]
     delay: u32,
     #[serde(default = "default_max_pages")]
     max_pages: u32,
     #[serde(default = "default_min_skip_pages")]
     min_skip_pages: u32,
+    /// Whether to keep raw metadata of seen illusts in the database.
     #[serde(default)]
     archive: bool,
     /// Consumers of new/updated illusts; empty disables webhooks.
@@ -382,6 +383,14 @@ impl Callback {
     }
 }
 
+fn refresh_token(config: &Config) -> Result<String> {
+    env::var("PIXIV_REFRESH_TOKEN")
+        .ok()
+        .or_else(|| config.refresh_token.clone())
+        .or_else(|| option_env!("PIXIV_REFRESH_TOKEN").map(str::to_owned))
+        .context("no refresh token: set PIXIV_REFRESH_TOKEN or refresh_token in config.json")
+}
+
 async fn finalize_http(resp: reqwest::Response) {
     let st = resp.status();
     debug!("http status: {st}");
@@ -416,7 +425,7 @@ async fn main() -> Result<()> {
         Ok((state, api_state)) => App::load(state, api_state, db_conn)?,
         Err(e) => {
             warn!("load state from database: {e:#?}");
-            let app = App::new(&config.refresh_token, db_conn).await?;
+            let app = App::new(&refresh_token(&config)?, db_conn).await?;
             // Save initial state immediately so it exists in db
             store::save_state(&app.db, &app.state)?;
             store::save_token(&app.db, &app.api.state)?;
